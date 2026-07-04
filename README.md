@@ -46,7 +46,12 @@ Pre-trained StreamVGGT is also available at both [Hugging Face](https://huggingf
 TODO: instructions for downloading/preprocessing datasets
 
 ### Evaluation Datasets
-Please refer to [MonST3R](https://github.com/Junyi42/monst3r/blob/main/data/evaluation_script.md) and [Spann3R](https://github.com/HengyiWang/spann3r/blob/main/docs/data_preprocess.md) to prepare Sintel, Bonn, KITTI, NYU-v2, ScanNet, 7scenes and Neural-RGBD datasets. Preprocessing scripts are available in `datasets_preprocess`.
+Please refer to [MonST3R](https://github.com/Junyi42/monst3r/blob/main/data/evaluation_script.md) and [Spann3R](https://github.com/HengyiWang/spann3r/blob/main/docs/data_preprocess.md) to prepare Sintel, Bonn, KITTI, NYU-v2, ScanNet, 7scenes and Neural-RGBD datasets. 
+
+For Sintel, Bonn, KITTI, and NYU-v2, download scripts are available in `datasets_download`; preprocessing scripts are available in `datasets_preprocess`. These scripts are taken directly from the MONST3R repo for ease of use.
+Download: `bash datasets_download/download_<name>.sh`
+Preprocess: `python datasets_preprocess prepare_<name>.sh`
+Sintel preprocessing is omitted since it is not necessary.
 
 ## Folder Structure
 The overall folder structure should be organized as follows：
