@@ -2,7 +2,8 @@ torch==2.3.1
 torchvision==0.18.1
 numpy==1.26.1
 Pillow==10.3.0
-huggingface_hub
+transformers==5.0.0
+huggingface_hub==1.22.0
 safetensors
 roma
 gradio
@@ -12,7 +13,7 @@ opencv-python
 scipy
 einops
 trimesh
-tensorboard
+wandb
 pyglet<2
 viser
 gradio
@@ -20,7 +21,6 @@ lpips
 hydra-core
 h5py
 accelerate
-transformers
 scikit-learn
 gsplat
 evo

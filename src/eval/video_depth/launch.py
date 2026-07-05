@@ -66,7 +66,7 @@ def get_args_parser():
 
 def eval_pose_estimation(args, model, save_dir=None):
     metadata = dataset_metadata.get(args.eval_dataset)
-    img_path = metadata["img_path"]
+    img_path = os.path.expanduser(metadata["img_path"])
     mask_path = metadata["mask_path"]
 
     ate_mean, rpe_trans_mean, rpe_rot_mean = eval_pose_estimation_dist(
@@ -80,6 +80,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
     metadata = dataset_metadata.get(args.eval_dataset)
     anno_path = metadata.get("anno_path", None)
+    if anno_path is not None:
+        anno_path = os.path.expanduser(anno_path)
 
     seq_list = args.seq_list
     if seq_list is None:
@@ -100,6 +102,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
     distributed_state = PartialState()
     model.to(distributed_state.device)
     device = distributed_state.device
+
+    os.makedirs(save_dir, exist_ok=True)
 
     with distributed_state.split_between_processes(seq_list) as seqs:
         ate_list = []

@@ -31,6 +31,12 @@ def get_args_parser():
         default="scale&shift",
         choices=["scale&shift", "scale", "metric"],
     )
+    parser.add_argument(
+        "--pose_eval_stride",
+        default=1,
+        type=int,
+        help="stride used when generating predictions, so ground truth can be subsampled to match",
+    )
     return parser
 
 
@@ -69,7 +75,9 @@ def main(args):
             full = False
 
         if full:
-            depth_pathes = glob.glob(f"../data/eval/sintel/training/depth/*/*.dpt")
+            depth_pathes = glob.glob(
+                os.path.expanduser("~/scratch/data/sintel/training/depth/*/*.dpt")
+            )
             depth_pathes = sorted(depth_pathes)
         else:
             seq_list = [
@@ -89,7 +97,8 @@ def main(args):
                 "temple_3",
             ]
             depth_pathes_folder = [
-                f"../data/eval/sintel/training/depth/{seq}" for seq in seq_list
+                os.path.expanduser(f"~/scratch/data/sintel/training/depth/{seq}")
+                for seq in seq_list
             ]
             depth_pathes = []
             for depth_pathes_folder_i in depth_pathes_folder:
@@ -187,7 +196,9 @@ def main(args):
         seq_list = ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"]
 
         img_pathes_folder = [
-            f"../data/eval/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/rgb_110/*.png"
+            os.path.expanduser(
+                f"~/scratch/data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/rgb_110/*.png"
+            )
             for seq in seq_list
         ]
         img_pathes = []
@@ -195,12 +206,15 @@ def main(args):
             img_pathes += glob.glob(img_pathes_folder_i)
         img_pathes = sorted(img_pathes)
         depth_pathes_folder = [
-            f"../data/eval/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/depth_110/*.png"
+            os.path.expanduser(
+                f"~/scratch/data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/depth_110/*.png"
+            )
             for seq in seq_list
         ]
         depth_pathes = []
         for depth_pathes_folder_i in depth_pathes_folder:
-            depth_pathes += glob.glob(depth_pathes_folder_i)
+            seq_depth_pathes = sorted(glob.glob(depth_pathes_folder_i))
+            depth_pathes += seq_depth_pathes[:: args.pose_eval_stride]
         depth_pathes = sorted(depth_pathes)
         pred_pathes = glob.glob(
             f"{args.output_dir}/*/frame*.npy"
@@ -298,7 +312,9 @@ def main(args):
             return depth
 
         depth_pathes = glob.glob(
-            "../data/eval/kitti/depth_selection/val_selection_cropped/groundtruth_depth_gathered/*/*.png"
+            os.path.expanduser(
+                "~/scratch/data/kitti/depth_selection/val_selection_cropped/groundtruth_depth_gathered/*/*.png"
+            )
         )
         depth_pathes = sorted(depth_pathes)
         pred_pathes = glob.glob(

@@ -20,7 +20,6 @@ from itertools import islice
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -61,6 +60,10 @@ from streamvggt.models.streamvggt import StreamVGGT
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
+
+WANDB_PROJECT = "MeTRIC"
+WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
+WANDB_MODE = "offline"
 
 
 def setup_for_distributed(accelerator: Accelerator):
@@ -115,6 +118,7 @@ def train(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
+        log_with="wandb",
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
@@ -127,6 +131,19 @@ def train(args):
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    wandb_init_kwargs = {
+        "name": args.exp_name,
+        "dir": args.output_dir,
+        "mode": WANDB_MODE,
+    }
+    if WANDB_ENTITY:
+        wandb_init_kwargs["entity"] = WANDB_ENTITY
+    accelerator.init_trackers(
+        project_name=WANDB_PROJECT,
+        config=OmegaConf.to_container(args, resolve=True),
+        init_kwargs={"wandb": wandb_init_kwargs},
+    )
 
     if accelerator.is_main_process:
         dst_dir = save_current_code(outdir=args.output_dir)
@@ -271,9 +288,6 @@ def train(args):
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
-            if log_writer is not None:
-                log_writer.flush()
-
             log_stats = dict(
                 epoch=epoch, **{f"train_{k}": v for k, v in train_stats.items()}
             )
@@ -301,10 +315,6 @@ def train(args):
             fname=fname,
             best_so_far=best_so_far,
         )
-
-    log_writer = (
-        SummaryWriter(log_dir=args.output_dir) if accelerator.is_main_process else None
-    )
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -342,7 +352,6 @@ def train(args):
             accelerator,
             epoch,
             loss_scaler,
-            log_writer=log_writer,
             args=args
         )
 
@@ -352,6 +361,7 @@ def train(args):
     printer.info("Training time {}".format(total_time_str))
 
     save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
+    accelerator.end_training()
 
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
@@ -398,7 +408,6 @@ def train_one_epoch(
     epoch: int,
     loss_scaler,
     args,
-    log_writer=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -421,9 +430,6 @@ def train_one_epoch(
             fname=fname,
             best_so_far=best_so_far,
         )
-
-    if log_writer is not None:
-        printer.info("log_dir: {}".format(log_writer.log_dir))
 
     if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
         data_loader.dataset.set_epoch(epoch)
@@ -516,22 +522,19 @@ def train_one_epoch(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()  # MUST BE EXECUTED BY ALL NODES
 
-                if log_writer is None:
-                    continue
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
-                epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
+                log_dict = {
+                    "train_loss": loss_value_reduce,
+                    "train_lr": lr,
+                    "epoch": epoch_f,
+                }
                 for name, val in loss_details.items():
                     if isinstance(val, torch.Tensor):
                         if val.ndim > 0:
                             continue
                     if isinstance(val, dict):
                         continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                    log_dict["train_" + name] = val
+                accelerator.log(log_dict, step=step)
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0
