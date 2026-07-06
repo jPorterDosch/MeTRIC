@@ -1,29 +1,20 @@
 from copy import copy, deepcopy
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from dust3r.inference import get_pred_pts3d, find_opt_scaling
 from dust3r.utils.geometry import (
     inv,
     geotrf,
-    normalize_pointcloud,
     normalize_pointcloud_group,
 )
 from dust3r.utils.geometry import (
-    get_group_pointcloud_depth,
     get_group_pointcloud_center_scale,
-    weighted_procrustes,
 )
-from gsplat import rasterization
 import numpy as np
-import lpips
 from dust3r.utils.camera import (
-    pose_encoding_to_camera,
     camera_to_pose_encoding,
     relative_pose_absT_quatR,
 )
-
 
 
 def Sum(*losses_and_masks):
@@ -48,9 +39,9 @@ class LLoss(BaseCriterion):
     """L-norm loss"""
 
     def forward(self, a, b):
-        assert (
-            a.shape == b.shape and a.ndim >= 2 and 1 <= a.shape[-1] <= 3
-        ), f"Bad shape = {a.shape}"
+        assert a.shape == b.shape and a.ndim >= 2 and 1 <= a.shape[-1] <= 3, (
+            f"Bad shape = {a.shape}"
+        )
         dist = self.distance(a, b)
         if self.reduction == "none":
             return dist
@@ -85,9 +76,9 @@ MSE = MSELoss()
 class Criterion(nn.Module):
     def __init__(self, criterion=None):
         super().__init__()
-        assert isinstance(
-            criterion, BaseCriterion
-        ), f"{criterion} is not a proper criterion!"
+        assert isinstance(criterion, BaseCriterion), (
+            f"{criterion} is not a proper criterion!"
+        )
         self.criterion = copy(criterion)
 
     def get_name(self):
@@ -214,8 +205,8 @@ class RGBLoss(Criterion, MultiLoss):
         details = {}
         self_name = type(self).__name__
         for i, l in enumerate(ls):
-            details[self_name + f"_rgb/{i+1}"] = float(l)
-            details[f"pred_rgb_{i+1}"] = pred_rgbs[i]
+            details[self_name + f"_rgb/{i + 1}"] = float(l)
+            details[f"pred_rgb_{i + 1}"] = pred_rgbs[i]
         rgb_loss = sum(ls) / len(ls)
         return rgb_loss, details
 
@@ -480,12 +471,11 @@ class Regr3DPose(Criterion, MultiLoss):
             (gt[:, :3] / pose_norm_factor_gt.clip(eps), gt[:, 3:]) for gt in gt_poses
         ]
         pr_poses = [
-            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
+            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:7]) for pr in pr_poses
         ]
         pose_masks = (pose_norm_factor_gt.squeeze(-1) > eps) & (
             pose_norm_factor_pr.squeeze(-1) > eps
         )
-
 
         skys = [gt["sky_mask"] & ~valid for gt, valid in zip(gts, valids)]
         return (
@@ -626,7 +616,7 @@ class Regr3DPose(Criterion, MultiLoss):
             (gt[:, :3] / pose_norm_factor_gt.clip(eps), gt[:, 3:]) for gt in gt_poses
         ]
         pr_poses = [
-            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
+            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:7]) for pr in pr_poses
         ]
 
         pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
@@ -745,11 +735,10 @@ class Regr3DPose(Criterion, MultiLoss):
         ) = self.get_all_pts3d(gts, preds, **kw)
 
         if self.sky_loss_value > 0:
-            assert (
-                self.criterion.reduction == "none"
-            ), "sky_loss_value should be 0 if no conf loss"
+            assert self.criterion.reduction == "none", (
+                "sky_loss_value should be 0 if no conf loss"
+            )
             masks = [mask | sky for mask, sky in zip(masks, skys)]
-
 
         # if self.sky_loss_value > 0:
         #     assert (
@@ -794,25 +783,23 @@ class Regr3DPose(Criterion, MultiLoss):
                 details[f"desc_{i + 1}"] = preds[i]["desc"].detach()
 
         if self.sky_loss_value > 0:
-            assert (
-                self.criterion.reduction == "none"
-            ), "sky_loss_value should be 0 if no conf loss"
+            assert self.criterion.reduction == "none", (
+                "sky_loss_value should be 0 if no conf loss"
+            )
             for i, l in enumerate(ls_cross):
                 ls_cross[i] = torch.where(
                     skys_cross[i][masks_cross[i]], self.sky_loss_value, l
                 )
 
         for i in range(len(ls_cross)):
-            details[self_name + f"_pts3d/{i+1}"] = float(
+            details[self_name + f"_pts3d/{i + 1}"] = float(
                 ls_cross[i].mean() if ls_cross[i].numel() > 0 else 0
             )
-            details[f"conf_{i+1}"] = preds[i]["conf"].detach()
+            details[f"conf_{i + 1}"] = preds[i]["conf"].detach()
 
         ls = ls_cross
         masks = masks_cross
-        details["img_ids"] = (
-            np.arange(len(ls_cross)).tolist()
-        )
+        details["img_ids"] = np.arange(len(ls_cross)).tolist()
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)
@@ -866,9 +853,9 @@ class Regr3DPoseBatchList(Regr3DPose):
         ) = self.get_all_pts3d(gts, preds, **kw)
 
         if self.sky_loss_value > 0:
-            assert (
-                self.criterion.reduction == "none"
-            ), "sky_loss_value should be 0 if no conf loss"
+            assert self.criterion.reduction == "none", (
+                "sky_loss_value should be 0 if no conf loss"
+            )
             masks = [mask | sky for mask, sky in zip(masks, skys)]
 
         camera_only = gts[0]["camera_only"]
@@ -882,7 +869,6 @@ class Regr3DPoseBatchList(Regr3DPose):
         else:
             # list [(B, h, w, 3)] x num_views -> list [num_views, h, w, 3] x B
             masks_b = torch.unbind(torch.stack(masks, dim=1), dim=0)
-
 
         self_name = type(self).__name__
 
@@ -919,9 +905,9 @@ class Regr3DPoseBatchList(Regr3DPose):
         ls_cross = self.reorg(ls_cross_b, masks_cross_b)
 
         if self.sky_loss_value > 0:
-            assert (
-                self.criterion.reduction == "none"
-            ), "sky_loss_value should be 0 if no conf loss"
+            assert self.criterion.reduction == "none", (
+                "sky_loss_value should be 0 if no conf loss"
+            )
             masks_cross = [mask[~camera_only] for mask in masks]
             skys_cross = [sky[~camera_only] for sky in skys]
             for i, l in enumerate(ls_cross):
@@ -942,16 +928,14 @@ class Regr3DPoseBatchList(Regr3DPose):
                 details[f"desc_{i + 1}"] = preds[i]["desc"].detach()
 
         for i in range(len(ls_cross)):
-            details[self_name + f"_pts3d/{i+1}"] = float(
+            details[self_name + f"_pts3d/{i + 1}"] = float(
                 ls_cross[i].mean() if ls_cross[i].numel() > 0 else 0
             )
-            details[f"conf_{i+1}"] = preds[i]["conf"].detach()
+            details[f"conf_{i + 1}"] = preds[i]["conf"].detach()
 
         ls = ls_cross
         masks = masks_cross
-        details["img_ids"] = (
-            np.arange(len(ls_cross)).tolist()
-        )
+        details["img_ids"] = np.arange(len(ls_cross)).tolist()
         pose_masks = pose_masks * gts[i]["img_mask"]
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
@@ -1005,11 +989,7 @@ class ConfLoss(MultiLoss):
             conf_loss = conf_loss.mean() if conf_loss.numel() > 0 else 0
             conf_losses.append(conf_loss)
 
-
-
-            details[self.get_name() + f"_conf_loss/{img_ids[i]+1}"] = float(
-                conf_loss
-            )
+            details[self.get_name() + f"_conf_loss/{img_ids[i] + 1}"] = float(conf_loss)
 
         details.pop("img_ids", None)
 
@@ -1051,7 +1031,6 @@ class Regr3DPose_ScaleInv(Regr3DPose):
 
         # subtract the median depth
         if self.gt_scale:
-
             pr_pts_cross = [
                 pr_pt_cross * gt_scale_cross / pred_scale_cross
                 for pr_pt_cross in pr_pts_cross
@@ -1074,373 +1053,3 @@ class Regr3DPose_ScaleInv(Regr3DPose):
             pose_masks,
             monitoring,
         )
-    
-def closed_form_scale_and_shift(pred, gt):
-    """ 
-    Args:
-        pred:   (B, H, W, C) 
-        gt:     (B, H, W, C) 
-        valid_mask: (B, H, W) 
-    Returns:
-        scale:  (B,) 
-        shift:  (B,) 
-    """
-    assert pred.dim() == 4 and gt.dim() == 4, "Inputs must be 4D tensors"
-    B, H, W, C = pred.shape
-    device = pred.device
-
-    pred_flat = pred.view(-1, C)  # (N, C)
-    gt_flat = gt.view(-1, C)  # (N, C)
-
-    if C == 1: 
-        pred_mean = pred_flat.mean(dim=0)
-        gt_mean = gt_flat.mean(dim=0)
-
-        numerator = ((pred_flat - pred_mean) * (gt_flat - gt_mean)).sum(dim=0)
-        denominator = ((pred_flat - pred_mean) ** 2).sum(dim=0).clamp(min=1e-6)
-        scale = numerator / denominator
-
-        shift = gt_mean - scale * pred_mean
-        return scale, shift
-
-    elif C == 3:
-        pred_mean = pred_flat.mean(0)
-        gt_mean = gt_flat.mean(0)
-        pred_centered = pred_flat - pred_mean
-        gt_centered = gt_flat - gt_mean
-
-        scale = (pred_centered * gt_centered).sum() / (pred_centered ** 2).sum().clamp(min=1e-6)
-        shift = gt_mean - scale * pred_mean
-        return scale, shift
-
-    else:
-        raise ValueError(f"Unsupported channel dimension C={C}. Only 1 or 3 channels are supported.")
-
-def normalize_pointcloud(pts3d, valid_mask, eps=1e-3):
-    """
-    pts3d: B, H, W, 3
-    valid_mask: B, H, W
-    """
-    dist = pts3d.norm(dim=-1)
-    dist_sum = (dist * valid_mask).sum(dim=[1,2])
-    valid_count = valid_mask.sum(dim=[1,2])
-
-    avg_scale = (dist_sum / (valid_count + eps)).clamp(min=eps, max=1e3)
-
-    # avg_scale = avg_scale.view(-1, 1, 1, 1, 1)
-
-    pts3d = pts3d / avg_scale.view(-1, 1, 1, 1)
-    return pts3d, avg_scale
-
-def point_map_to_normal(point_map, mask, eps=1e-6):
-    """
-    point_map: (B, H, W, 3)  - 3D points laid out in a 2D grid
-    mask:      (B, H, W)     - valid pixels (bool)
-
-    Returns:
-      normals: (4, B, H, W, 3)  - normal vectors for each of the 4 cross-product directions
-      valids:  (4, B, H, W)     - corresponding valid masks
-    """
-
-    with torch.cuda.amp.autocast(enabled=False):
-        padded_mask = F.pad(mask, (1, 1, 1, 1), mode='constant', value=0)
-        pts = F.pad(point_map.permute(0, 3, 1, 2), (1,1,1,1), mode='constant', value=0).permute(0, 2, 3, 1)
-
-        center = pts[:, 1:-1, 1:-1, :]   # B,H,W,3
-        up     = pts[:, :-2,  1:-1, :]
-        left   = pts[:, 1:-1, :-2 , :]
-        down   = pts[:, 2:,   1:-1, :]
-        right  = pts[:, 1:-1, 2:,   :]
-
-        up_dir    = up    - center
-        left_dir  = left  - center
-        down_dir  = down  - center
-        right_dir = right - center
-
-        n1 = torch.cross(up_dir,   left_dir,  dim=-1)  # up x left
-        n2 = torch.cross(left_dir, down_dir,  dim=-1)  # left x down
-        n3 = torch.cross(down_dir, right_dir, dim=-1)  # down x right
-        n4 = torch.cross(right_dir,up_dir,    dim=-1)  # right x up
-
-        v1 = padded_mask[:, :-2,  1:-1] & padded_mask[:, 1:-1, 1:-1] & padded_mask[:, 1:-1, :-2]
-        v2 = padded_mask[:, 1:-1, :-2 ] & padded_mask[:, 1:-1, 1:-1] & padded_mask[:, 2:,   1:-1]
-        v3 = padded_mask[:, 2:,   1:-1] & padded_mask[:, 1:-1, 1:-1] & padded_mask[:, 1:-1, 2:]
-        v4 = padded_mask[:, 1:-1, 2:  ] & padded_mask[:, 1:-1, 1:-1] & padded_mask[:, :-2,  1:-1]
-
-        normals = torch.stack([n1, n2, n3, n4], dim=0)  # shape [4, B, H, W, 3]
-        valids  = torch.stack([v1, v2, v3, v4], dim=0)  # shape [4, B, H, W]
-
-        normals = F.normalize(normals, p=2, dim=-1, eps=eps)
-
-
-        # Zero out invalid entries so they don't pollute subsequent computations
-        # normals = normals * valids.unsqueeze(-1)
-
-    return normals, valids
-
-class CameraLoss(nn.Module):
-    def __init__(self, delta=1e-1, weights=(1.0, 1.0, 0.5)):
-        super().__init__()
-        self.weights = weights
-    def forward(self, pred_pose, gt_pose):
-        loss_T = (pred_pose[..., :3] - gt_pose[..., :3]).abs()
-        loss_R = (pred_pose[..., 3:7] - gt_pose[..., 3:7]).abs()
-        loss_FL = (pred_pose[..., 7:] - gt_pose[..., 7:]).abs()
-
-        loss_T = check_and_fix_inf_nan(loss_T, "loss_T")
-        loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
-        loss_FL = check_and_fix_inf_nan(loss_FL, "loss_FL")
-
-        # Clamp outlier translation loss to prevent instability, then average
-        loss_T = loss_T.clamp(max=100).mean()
-        loss_R = loss_R.mean()
-        loss_FL = loss_FL.mean()
-        return (self.weights[0] * loss_T + self.weights[1] * loss_R + self.weights[2] * loss_FL)
-
-class DepthOrPmapLoss(nn.Module):
-    def __init__(self, alpha=0.01):
-        super().__init__()
-        self.alpha = alpha
-        self.grad_scales = 3
-        self.gamma = 1.0 
-
-    def gradient_loss_multi_scale(self, pred, gt, mask=None):
-        total = 0
-        for s in range(self.grad_scales):
-            step = 2 ** s
-            pred_s = pred[:, ::step, ::step]
-            gt_s = gt[:, ::step, ::step]
-            mask_s = mask[:, ::step, ::step]
-            total += self.normal_loss(pred_s, gt_s, mask_s)
-        return total / self.grad_scales
-
-    def normal_loss(self, pred, gt, mask=None):
-        pred_norm, _ = point_map_to_normal(pred, mask)
-        gt_norm, _ = point_map_to_normal(gt, mask)
-        cos_sim = F.cosine_similarity(pred_norm, gt_norm, dim=-1)
-        return 1 - cos_sim.mean()
-
-    def image_gradient_loss(self, pred, gt, mask=None):
-        assert pred.dim() == 4 and pred.shape[-1] == 1
-        assert gt.shape == pred.shape
-
-        B, H, W, _ = pred.shape
-        device = pred.device
-
-        dx_pred = pred[:, :, 1:] - pred[:, :, :-1]  # [B,H,W-1,1]
-        dx_gt = gt[:, :, 1:] - gt[:, :, :-1]
-        dx_mask = mask[:, :, 1:] & mask[:, :, :-1]  # [B,H,W-1]
-
-        dy_pred = pred[:, 1:, :] - pred[:, :-1, :]  # [B,H-1,W,1]
-        dy_gt = gt[:, 1:, :] - gt[:, :-1, :]
-        dy_mask = mask[:, 1:, :] & mask[:, :-1, :]  # [B,H-1,W]
-
-        min_h = min(dy_pred.shape[1], dx_pred.shape[1])
-        min_w = min(dx_pred.shape[2], dy_pred.shape[2])
-
-        dx_pred = dx_pred[:, :min_h, :min_w, :]  # [B,H-1,W-1,1]
-        dx_gt = dx_gt[:, :min_h, :min_w, :]
-        dx_mask = dx_mask[:, :min_h, :min_w]  # [B,H-1,W-1]
-
-        dy_pred = dy_pred[:, :min_h, :min_w, :]  # [B,H-1,W-1,1]
-        dy_gt = dy_gt[:, :min_h, :min_w, :]
-        dy_mask = dy_mask[:, :min_h, :min_w]  # [B,H-1,W-1]
-
-        loss_dx = F.l1_loss(dx_pred * dx_mask.unsqueeze(-1),
-                            dx_gt * dx_mask.unsqueeze(-1))
-        loss_dy = F.l1_loss(dy_pred * dy_mask.unsqueeze(-1),
-                            dy_gt * dy_mask.unsqueeze(-1))
-
-        return (loss_dx + loss_dy) / 2
-
-    def forward(self, pred, gt, sigma_p=None, sigma_g=None, valid_mask=None):
-        if self.training:
-            pred_normalized, _ = normalize_pointcloud(pred, valid_mask)
-            gt_normalized, _ = normalize_pointcloud(gt, valid_mask)
-        else:
-            pred_normalized, gt_normalized = pred, gt
-        scale, shift = closed_form_scale_and_shift(
-            pred_normalized, gt_normalized
-        )
-        pred_aligned = pred_normalized * scale + shift
-        sigma_p = sigma_p.clamp(min=1e-6)
-        if sigma_g is not None:
-            sigma_g = sigma_g.clamp(min=1e-6)
-        #sigma = 0.5 * (sigma_p + sigma_g)
-        sigma = sigma_p
-        diff = (pred_aligned - gt_normalized).abs()
-
-        C = diff.shape[-1]
-
-        main_loss = (sigma[..., None].expand(-1, -1, -1, C) * diff)[valid_mask[..., None].expand(-1, -1, -1, C)].mean()
-
-        if pred.shape[-1] == 1:
-            grad_loss = self.image_gradient_loss(pred_aligned, gt_normalized, valid_mask)
-        else:
-            grad_loss = self.gradient_loss_multi_scale(pred_aligned, gt_normalized, valid_mask)
-        reg_loss = -self.alpha * torch.log(sigma.clamp(min=1e-6))[valid_mask].mean()
-        # return main + reg
-        return self.gamma * main_loss + grad_loss + reg_loss
-
-class TrackLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
-        self.alpha = 0.2
-        self.gamma = 1.0
-    def forward(self, y_pr, y_gt, vis_pr, vis_gt, w_p, w_g):
-        #w = 0.5 * (w_p + w_g)
-        w = w_p
-        l_pos = (y_pr - y_gt).norm(dim=-1)
-        l_pos = (w * l_pos).mean()
-
-        l_vis = self.bce(vis_pr, vis_gt.float())
-        l_vis = (w * l_vis).mean()
-        return l_pos + l_vis
-
-class FinetuneLoss(MultiLoss):
-    def __init__(self, lambda_track=0.05):
-        super().__init__()
-        self.cam_loss = CameraLoss(
-            delta=0.1,
-            weights=(1.0, 1.0, 0.5)
-        )
-        self.depth_loss = DepthOrPmapLoss(alpha=0.1)
-
-    def get_name(self): return "FinetuneLoss"
-
-    def compute_loss(self, gts, preds,
-                     track_queries=None, track_preds=None):
-        # ---------- Lcamera ----------
-        T = []
-        for g in gts:
-            T_c2w = g['camera_pose'] 
-            if not torch.is_tensor(T_c2w):
-                T_c2w = torch.as_tensor(T_c2w)
-            dtype = T_c2w.dtype
-            device = T_c2w.device
-
-            R = T_c2w[..., :3, :3]  # [...,3,3]
-            t = T_c2w[..., :3, 3:4]  # [...,3,1]
-
-            # c2w -> w2c: R^T, -R^T t
-            R_w2c = R.transpose(-1, -2)  # [...,3,3]
-            t_w2c = -(R_w2c @ t)  # [...,3,1]
-            
-            eye = torch.eye(4, dtype=dtype, device=device)
-            T_w2c = eye.expand(*T_c2w.shape[:-2], 4, 4).clone()  # [...,4,4]
-            T_w2c[..., :3, :3] = R_w2c
-            T_w2c[..., :3, 3:4] = t_w2c
-
-            if T_w2c.dim() == 2:
-                T_w2c = T_w2c.unsqueeze(0)
-
-            T.append(T_w2c)  # [B,4,4]
-
-        T_view = torch.stack(T, dim=1)
-        T_c2w_first = torch.inverse(T_view[:, 0])  
-
-        T_wprime2c = T_view @ T_c2w_first.unsqueeze(1)  # [B,V,4,4]
-        camera_extrinsics_gt = T_wprime2c
-        camera_intrinsics_gt = torch.stack([g['camera_intrinsics'] for g in gts], dim=1) # b v 3 3
-        images_hw = gts[0]["img"].shape[-2:]
-        cam_gt = extri_intri_to_pose_encoding(camera_extrinsics_gt, camera_intrinsics_gt, images_hw)
-        cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
-
-        Lcamera = self.cam_loss(cam_pr, cam_gt)
-
-        # ---------- Ldepth ----------
-        depth_terms = []
-        for g,p in zip(gts, preds):
-            if ('depth' in p):
-                sigma_p = p['depth_conf']
-                valid_mask = g['valid_mask']
-                if not valid_mask.any():
-                    valid_mask = torch.ones_like(g['valid_mask'])
-                depth_terms.append(self.depth_loss(p['depth'], g['depthmap'].unsqueeze(-1), sigma_p=sigma_p, valid_mask=valid_mask))
-        Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
-
-        total = Lcamera * 20 + Ldepth * 10
-        details = {}
-
-        details['Lcamera'] = float(Lcamera) * 20
-        details['Ldepth'] = float(Ldepth) * 10
-        details['total'] = float(total)
-
-        return total, details
-                         
-class DistillLoss(MultiLoss):
-    def __init__(self, lambda_track=0.05):
-        super().__init__()
-        self.cam_loss = CameraLoss(
-            delta=0.1,
-            weights=(1.0, 1.0, 0.5)
-        )
-        self.depth_loss = DepthOrPmapLoss(alpha=0.1)#init 0.01 now 0.1
-        self.pmap_loss = DepthOrPmapLoss(alpha=0.1)
-        self.track_loss = TrackLoss()
-        self.lambda_track = lambda_track
-
-    def get_name(self): return "DistillLoss"
-
-    def compute_loss(self, gts, preds,
-                     track_queries=None, track_preds=None):
-        # ---------- Lcamera ----------
-        cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
-        cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
-        Lcamera = self.cam_loss(cam_pr, cam_gt)
-
-        # ---------- Ldepth ----------
-        depth_terms = []
-        for g,p in zip(gts, preds):
-            if ('depth' in g) and ('depth' in p):
-                sigma_p = p['depth_conf']
-                sigma_g = g['depth_conf']
-                valid_mask = g['valid_mask']
-                if not valid_mask.any():
-                    valid_mask = torch.ones_like(g['valid_mask'])
-                depth_terms.append(self.depth_loss(p['depth'], g['depth'], sigma_p, sigma_g, valid_mask))
-        Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
-
-        # ---------- Lpmap ----------
-        pmap_terms = []
-        for g,p in zip(gts,preds):
-            sigma_p = p['conf']
-            sigma_g = g['conf']
-            valid_mask = g['valid_mask']
-            if not valid_mask.any():
-                valid_mask = torch.ones_like(g['valid_mask'])
-            pmap_terms.append(
-                self.pmap_loss(p['pts3d_in_other_view'],
-                               g['pts3d_in_other_view'],
-                               sigma_p,
-                               sigma_g,
-                               valid_mask))
-        Lpmap = torch.stack(pmap_terms).mean()
-
-        # ---------- Ltrack ----------
-        if ('track' in gts[0]) and ('track' in preds[0]):
-            y_gt = torch.stack([g['track'] for g in gts], dim=1)
-            vis_gt = torch.stack([g['vis'] for g in gts], dim=1)
-
-            y_pr = torch.stack([p['track'] for p in preds], dim=1)
-            vis_pr = torch.stack([p['vis'] for p in preds], dim=1)
-
-            w_p = torch.stack([p['track_conf'] for p in preds], dim=1)
-            w_g = torch.stack([g['track_conf'] for g in gts], dim=1)
-
-
-            Ltrack = self.track_loss(y_pr, y_gt, vis_pr, vis_gt, w_p, w_g)
-        else:
-            Ltrack = torch.zeros_like(Lcamera)
-
-        total = Lcamera * 20 + Ldepth * 20 + Lpmap * 10 + self.lambda_track * 10 * Ltrack
-        details = {}
-
-        details['Lcamera'] = float(Lcamera) * 20
-        details['Ldepth'] = float(Ldepth) * 20
-        details['Lpmap'] = float(Lpmap) * 10
-        details['Ltrack'] = float(Ltrack) * self.lambda_track * 10
-        details['total'] = float(total)
-
-        return total, details
