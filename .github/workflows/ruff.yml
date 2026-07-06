@@ -325,10 +325,16 @@ jobs:
             echo ""
             if [ -f .ruff-stats/rules_with_new_issues.txt ]; then
               PATTERN=$(paste -sd'|' .ruff-stats/rules_with_new_issues.txt)
+              # A rule-level delta (e.g. F841 +1) only means SOME occurrence is
+              # new; matching on .code alone would print every pre-existing
+              # occurrence of that rule repo-wide. Restrict to PR-changed files.
+              WS_PREFIX="${GITHUB_WORKSPACE:-$(pwd)}/"
+              FILES_FILTER=$(jq -R -s 'split("\n") | map(select(length > 0))' .ruff-stats/pr_changed_files.txt)
               # Full ruff-style output: file:line:col: CODE message
               # Include URL for documentation reference
-              jq -r --arg pattern "$PATTERN" '
+              jq -r --arg pattern "$PATTERN" --arg ws "$WS_PREFIX" --argjson files "$FILES_FILTER" '
                 select(.code | test($pattern)) |
+                select((.filename | ltrimstr($ws)) as $rel | $files | index($rel)) |
                 "\(.filename):L\(.location.row):\(.location.column): \(.code) \(.message)" +
                 (if .url then "\n    → \(.url)" else "" end)
               ' .ruff-stats/pr_ruff_output.json 2>/dev/null || echo "(could not parse ruff output)"

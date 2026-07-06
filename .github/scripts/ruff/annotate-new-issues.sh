@@ -48,19 +48,25 @@ fi
 # Get workspace prefix for path stripping (with trailing slash)
 WS_PREFIX=$(get_workspace_prefix)
 
-# Filter PR ruff output to only rules with positive deltas
-# Then format as GitHub annotations
+# Filter PR ruff output to only rules with positive deltas, AND only in
+# files this PR actually touched. A rule-level delta (e.g. F841 +1) means
+# SOME occurrence of that rule is new, but matching on .code alone would
+# annotate every pre-existing occurrence of that rule repo-wide. Restricting
+# to PR-changed files keeps this to (at worst) inherited issues in touched
+# files, not the whole codebase.
 # Note: pr_ruff_output.json is JSON-lines (one object per line)
 # Note: filenames are absolute, need to strip workspace prefix for GitHub
 # Using -r (not -rs) for efficient line-by-line processing without slurping
 # Guard: skip entries without .location (defensive, should not happen with ruff)
+FILES_FILTER=$(text_to_json_array "$D/pr_changed_files.txt")
 
 # Generate annotations and count them
 # Store in temp file to both output and count
 TEMP_ANNOTATIONS="$D/annotations.txt"
-jq -r --arg pattern "$PATTERN" --arg ws "$WS_PREFIX" '
+jq -r --arg pattern "$PATTERN" --arg ws "$WS_PREFIX" --argjson files "$FILES_FILTER" '
   select(.code | test($pattern)) |
   select(.location != null) |
+  select((.filename | ltrimstr($ws)) as $rel | $files | index($rel)) |
   "::error file=\(.filename | ltrimstr($ws)),line=\(.location.row),col=\(.location.column)::\(.code): \(.message)"
 ' "$D/pr_ruff_output.json" > "$TEMP_ANNOTATIONS"
 
