@@ -323,15 +323,21 @@ jobs:
             # Show full ruff output for regressions only
             echo "=== Ruff Output (new issues only) ==="
             echo ""
-            if [ -f .ruff-stats/rules_with_new_issues.txt ]; then
-              PATTERN=$(paste -sd'|' .ruff-stats/rules_with_new_issues.txt)
+            if [ -f .ruff-stats/new_issues_precise.json ]; then
+              # new_issues_precise.json (built by collect-stats.sh) is the exact
+              # set of new occurrences, matched by (code, message) with
+              # one-for-one cancellation against main's counts — not just "any
+              # occurrence of a rule/file that regressed somewhere", which
+              # would also print pre-existing issues merely shifted by
+              # unrelated edits, or moved wholesale from a renamed file.
+              WS_PREFIX="${GITHUB_WORKSPACE:-$(pwd)}/"
               # Full ruff-style output: file:line:col: CODE message
               # Include URL for documentation reference
-              jq -r --arg pattern "$PATTERN" '
-                select(.code | test($pattern)) |
-                "\(.filename):L\(.location.row):\(.location.column): \(.code) \(.message)" +
+              jq -r --arg ws "$WS_PREFIX" '
+                .[] |
+                "\(.filename | ltrimstr($ws)):L\(.location.row):\(.location.column): \(.code) \(.message)" +
                 (if .url then "\n    → \(.url)" else "" end)
-              ' .ruff-stats/pr_ruff_output.json 2>/dev/null || echo "(could not parse ruff output)"
+              ' .ruff-stats/new_issues_precise.json 2>/dev/null || echo "(could not parse ruff output)"
             fi
             echo ""
 

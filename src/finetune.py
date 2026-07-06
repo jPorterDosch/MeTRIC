@@ -17,7 +17,6 @@ from typing import Sized
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -25,7 +24,6 @@ from dust3r.datasets import get_data_loader
 from streamvggt.loss.loss import *  # noqa: F401, needed when loading the model
 from dust3r.inference import loss_of_one_batch  # noqa
 from dust3r.viz import colorize
-from dust3r.utils.render import get_render_results
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
@@ -48,6 +46,9 @@ from vggt.models.vggt import VGGT
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
+
+WANDB_PROJECT = "MeTRIC"
+WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
 
 
 def setup_for_distributed(accelerator: Accelerator):
@@ -102,6 +103,7 @@ def train(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
+        log_with="wandb",
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
@@ -114,6 +116,18 @@ def train(args):
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    wandb_init_kwargs = {
+        "name": args.exp_name,
+        "dir": args.output_dir,
+    }
+    if WANDB_ENTITY:
+        wandb_init_kwargs["entity"] = WANDB_ENTITY
+    accelerator.init_trackers(
+        project_name=WANDB_PROJECT,
+        config=OmegaConf.to_container(args, resolve=True),
+        init_kwargs={"wandb": wandb_init_kwargs},
+    )
 
     if accelerator.is_main_process:
         dst_dir = save_current_code(outdir=args.output_dir)
@@ -251,9 +265,6 @@ def train(args):
 
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
-            if log_writer is not None:
-                log_writer.flush()
-
             log_stats = dict(
                 epoch=epoch, **{f"train_{k}": v for k, v in train_stats.items()}
             )
@@ -282,10 +293,6 @@ def train(args):
             best_so_far=best_so_far,
         )
 
-    log_writer = (
-        SummaryWriter(log_dir=args.output_dir) if accelerator.is_main_process else None
-    )
-
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     train_stats = test_stats = {}
@@ -312,7 +319,7 @@ def train(args):
         #             accelerator,
         #             device,
         #             epoch,
-        #             log_writer=log_writer,
+        #             epoch * len(data_loader_train),  # step: keep aligned with train_one_epoch's step axis
         #             args=args,
         #             prefix=test_name,
         #         )
@@ -342,7 +349,6 @@ def train(args):
             accelerator,
             epoch,
             loss_scaler,
-            log_writer=log_writer,
             args=args,
         )
 
@@ -351,6 +357,7 @@ def train(args):
     printer.info("Training time {}".format(total_time_str))
 
     save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
+    accelerator.end_training()
 
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
@@ -398,7 +405,6 @@ def train_one_epoch(
     epoch: int,
     loss_scaler,
     args,
-    log_writer=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -421,9 +427,6 @@ def train_one_epoch(
             fname=fname,
             best_so_far=best_so_far,
         )
-
-    if log_writer is not None:
-        printer.info("log_dir: {}".format(log_writer.log_dir))
 
     if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
         data_loader.dataset.set_epoch(epoch)
@@ -494,13 +497,13 @@ def train_one_epoch(
             curr_num_view = len(batch)
 
             del loss
-            tb_vis_img = (data_iter_step + 1) % accum_iter == 0 and (
-                (step + 1) % (args.print_img_freq)
-            ) == 0
-            if not tb_vis_img:
-                del batch
-            else:
-                torch.cuda.empty_cache()
+            # Image visualization to wandb is disabled for now (no storage budget for
+            # per-epoch image logging). Re-enable by restoring tb_vis_img gating below
+            # and the commented block further down if needed.
+            # tb_vis_img = (data_iter_step + 1) % accum_iter == 0 and (
+            #     (step + 1) % (args.print_img_freq)
+            # ) == 0
+            del batch
 
             lr = optimizer.param_groups[0]["lr"]
             metric_logger.update(epoch=epoch_f)
@@ -516,46 +519,41 @@ def train_one_epoch(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()  # MUST BE EXECUTED BY ALL NODES
 
-                if log_writer is None:
-                    continue
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
-                epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
+                log_dict = {
+                    "train_loss": loss_value_reduce,
+                    "train_lr": lr,
+                    "epoch": epoch_f,
+                }
                 for name, val in loss_details.items():
                     if isinstance(val, torch.Tensor):
                         if val.ndim > 0:
                             continue
                     if isinstance(val, dict):
                         continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                    log_dict["train_" + name] = val
+                accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
-            if tb_vis_img:
-                if log_writer is None:
-                    continue
-                with torch.no_grad():
-                    depths_cross, gt_depths_cross = get_render_results(
-                        batch, result["pred"], self_view=False
-                    )
-                    for k in range(len(batch)):
-                        loss_details[f"pred_depth_{k + 1}"] = (
-                            depths_cross[k].detach().cpu()
-                        )
-                        loss_details[f"gt_depth_{k + 1}"] = (
-                            gt_depths_cross[k].detach().cpu()
-                        )
-
-                imgs_stacked_dict = get_vis_imgs_new(
-                    loss_details, args.num_imgs_vis, curr_num_view, is_metric=is_metric
-                )
-                for name, imgs_stacked in imgs_stacked_dict.items():
-                    log_writer.add_images(
-                        "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
-                    )
-                del batch
+            # if tb_vis_img:
+            #     with torch.no_grad():
+            #         depths_cross, gt_depths_cross = get_render_results(
+            #             batch, result["pred"], self_view=False
+            #         )
+            #         for k in range(len(batch)):
+            #             loss_details[f"pred_depth_{k + 1}"] = (
+            #                 depths_cross[k].detach().cpu()
+            #             )
+            #             loss_details[f"gt_depth_{k + 1}"] = (
+            #                 gt_depths_cross[k].detach().cpu()
+            #             )
+            #
+            #     imgs_stacked_dict = get_vis_imgs_new(
+            #         loss_details, args.num_imgs_vis, curr_num_view, is_metric=is_metric
+            #     )
+            #     for name, imgs_stacked in imgs_stacked_dict.items():
+            #         log_writer.add_images(
+            #             "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
+            #         )
+            #     del batch
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0
@@ -568,6 +566,22 @@ def train_one_epoch(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
+
+    # Always log once at the end of the epoch, using the epoch-averaged (global_avg)
+    # value for each metric rather than a single noisy last-batch value. This also
+    # guarantees at least one log per epoch even if print_freq never divides evenly
+    # into the number of steps (e.g. short smoke-test runs).
+    epoch_log_dict = {}
+    for name, meter in metric_logger.meters.items():
+        if name == "step":
+            continue
+        elif name == "epoch":
+            key = "epoch"
+        else:
+            key = f"train_{name}"
+        epoch_log_dict[key] = meter.global_avg
+    accelerator.log(misc.aggregate_per_view_metrics(epoch_log_dict), step=step)
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -580,8 +594,8 @@ def test_one_epoch(
     accelerator: Accelerator,
     device: torch.device,
     epoch: int,
+    step: int,
     args,
-    log_writer=None,
     prefix="test",
 ):
 
@@ -589,9 +603,6 @@ def test_one_epoch(
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
     header = "Test Epoch: [{}]".format(epoch)
-
-    if log_writer is not None:
-        printer.info("log_dir: {}".format(log_writer.log_dir))
 
     if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
         data_loader.dataset.set_epoch(0)
@@ -627,32 +638,35 @@ def test_one_epoch(
         for tag, attr in aggs
     }
 
-    if log_writer is not None:
-        for name, val in results.items():
-            if isinstance(val, torch.Tensor):
-                if val.ndim > 0:
-                    continue
-            if isinstance(val, dict):
+    log_dict = {}
+    for name, val in results.items():
+        if isinstance(val, torch.Tensor):
+            if val.ndim > 0:
                 continue
-            log_writer.add_scalar(prefix + "_" + name, val, 1000 * epoch)
+        if isinstance(val, dict):
+            continue
+        log_dict[prefix + "_" + name] = val
+    accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
-        depths_cross, gt_depths_cross = get_render_results(
-            batch, result["pred"], self_view=False
-        )
-        for k in range(len(batch)):
-            loss_details[f"pred_depth_{k + 1}"] = depths_cross[k].detach().cpu()
-            loss_details[f"gt_depth_{k + 1}"] = gt_depths_cross[k].detach().cpu()
-
-        imgs_stacked_dict = get_vis_imgs_new(
-            loss_details,
-            args.num_imgs_vis,
-            args.num_test_views,
-            is_metric=batch[0]["is_metric"],
-        )
-        for name, imgs_stacked in imgs_stacked_dict.items():
-            log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
-            )
+    # Image visualization to wandb is disabled for now (no storage budget for
+    # per-epoch image logging). Re-enable by restoring the block below if needed.
+    # depths_cross, gt_depths_cross = get_render_results(
+    #     batch, result["pred"], self_view=False
+    # )
+    # for k in range(len(batch)):
+    #     loss_details[f"pred_depth_{k + 1}"] = depths_cross[k].detach().cpu()
+    #     loss_details[f"gt_depth_{k + 1}"] = gt_depths_cross[k].detach().cpu()
+    #
+    # imgs_stacked_dict = get_vis_imgs_new(
+    #     loss_details,
+    #     args.num_imgs_vis,
+    #     args.num_test_views,
+    #     is_metric=batch[0]["is_metric"],
+    # )
+    # for name, imgs_stacked in imgs_stacked_dict.items():
+    #     log_writer.add_images(
+    #         prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+    #     )
 
     del loss_details, loss_value, batch
     torch.cuda.empty_cache()
