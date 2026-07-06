@@ -475,8 +475,8 @@ def train_one_epoch(
                 )
                 optimizer.zero_grad()
 
-            is_metric = batch[0]["is_metric"]
-            curr_num_view = len(batch)
+            # is_metric = batch[0]["is_metric"]
+            # curr_num_view = len(batch)
 
             del loss
 
