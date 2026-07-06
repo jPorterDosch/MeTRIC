@@ -17,15 +17,17 @@ def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--arkitscenes_dir",
-        default="data/dust3r_data/data_arkitscenes/raw",
+        default=os.path.expanduser("~/scratch/data/dust3r_data/data_arkitscenes/raw"),
     )
     parser.add_argument(
         "--precomputed_pairs",
-        default="data/dust3r_data/data_arkitscenes/arkitscenes_pairs",
+        default=os.path.expanduser(
+            "~/scratch/data/dust3r_data/data_arkitscenes/arkitscenes_pairs"
+        ),
     )
     parser.add_argument(
         "--output_dir",
-        default="data/dust3r_data/processed_arkitscenes",
+        default="~/scratch/data/dust3r_data/processed_arkitscenes",
     )
     return parser
 

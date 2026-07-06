@@ -40,15 +40,48 @@ conda install 'llvm-openmp<16'
 ### Download Checkpoints
 Pre-trained StreamVGGT is also available at both [Hugging Face](https://huggingface.co/lch01/StreamVGGT/) and [Tsinghua cloud](https://cloud.tsinghua.edu.cn/d/d6ad8f36fcd541bcb246/).
 
+To download from huggingface, after installing `requirements.txt`, run
+```
+hf download lch01/StreamVGGT \
+  --local-dir ./StreamVGGT
+```
+
+### Logging (Weights & Biases)
+
+Training runs are logged to [wandb](https://wandb.ai). Set your API key
+(from https://wandb.ai/authorize) before launching:
+
+    export WANDB_API_KEY=your_key_here
+
+To run without logging, set `WANDB_MODE=offline` or `WANDB_MODE=disabled`.
 
 ## Data Preparation
 ### Training Datasets
-TODO: instructions for downloading/preprocessing datasets
+#### ARKitScenes
+Download the raw data using the script provided by Apple
+`bash download_arkit_scenes.sh`
+
+Download the precomputed pairs provided by DUST3R
+```
+mkdir -p ~/scratch/data/arkit_scenes
+cd ~/scratch/data/arkit_scenes
+
+wget https://download.europe.naverlabs.com/ComputerVision/DUSt3R/arkitscenes_pairs.zip
+
+unzip arkitscenes_pairs.zip
+```
+
+Then run:
+```
+python preprocess_arkitscenes.py --arkitscenes_dir /path/to/your/raw/data --precomputed_pairs /path/to/your/pairs --output_dir /path/to/your/outdir
+
+python generate_set_arkitscenes.py --root /path/to/your/outdir --splits Training Test --max_interval 5.0 --num_workers 8
+```
 
 ### Evaluation Datasets
 Please refer to [MonST3R](https://github.com/Junyi42/monst3r/blob/main/data/evaluation_script.md) and [Spann3R](https://github.com/HengyiWang/spann3r/blob/main/docs/data_preprocess.md) to prepare Sintel, Bonn, KITTI, NYU-v2, ScanNet, 7scenes and Neural-RGBD datasets. 
 
-For Sintel, Bonn, KITTI, and NYU-v2, download scripts are available in `datasets_download`; preprocessing scripts are available in `datasets_preprocess`. These scripts are taken directly from the MONST3R repo for ease of use.
+For Sintel, Bonn, and KITTI, download scripts are available in `datasets_download`; preprocessing scripts are available in `datasets_preprocess`. These scripts are taken directly from the MONST3R repo for ease of use.
 Download: `bash datasets_download/download_<name>.sh`
 Preprocess: `python datasets_preprocess prepare_<name>.sh`
 Sintel preprocessing is omitted since it is not necessary.
@@ -61,6 +94,9 @@ MeTRIC
 ├── ckpt/
 |   ├── model.pt
 |   └── checkpoints.pth
+|
+└── src/
+    ├── ...
 ```
 
 ## Evaluation
