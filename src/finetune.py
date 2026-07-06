@@ -319,6 +319,7 @@ def train(args):
         #             accelerator,
         #             device,
         #             epoch,
+        #             epoch * len(data_loader_train),  # step: keep aligned with train_one_epoch's step axis
         #             args=args,
         #             prefix=test_name,
         #         )
@@ -530,7 +531,7 @@ def train_one_epoch(
                     if isinstance(val, dict):
                         continue
                     log_dict["train_" + name] = val
-                accelerator.log(log_dict, step=step)
+                accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
             # if tb_vis_img:
             #     with torch.no_grad():
@@ -565,6 +566,22 @@ def train_one_epoch(
     # gather the stats from all processes
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
+
+    # Always log once at the end of the epoch, using the epoch-averaged (global_avg)
+    # value for each metric rather than a single noisy last-batch value. This also
+    # guarantees at least one log per epoch even if print_freq never divides evenly
+    # into the number of steps (e.g. short smoke-test runs).
+    epoch_log_dict = {}
+    for name, meter in metric_logger.meters.items():
+        if name == "step":
+            continue
+        elif name == "epoch":
+            key = "epoch"
+        else:
+            key = f"train_{name}"
+        epoch_log_dict[key] = meter.global_avg
+    accelerator.log(misc.aggregate_per_view_metrics(epoch_log_dict), step=step)
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -577,6 +594,7 @@ def test_one_epoch(
     accelerator: Accelerator,
     device: torch.device,
     epoch: int,
+    step: int,
     args,
     prefix="test",
 ):
@@ -628,7 +646,7 @@ def test_one_epoch(
         if isinstance(val, dict):
             continue
         log_dict[prefix + "_" + name] = val
-    accelerator.log(log_dict, step=1000 * epoch)
+    accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
     # Image visualization to wandb is disabled for now (no storage budget for
     # per-epoch image logging). Re-enable by restoring the block below if needed.

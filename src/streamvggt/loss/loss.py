@@ -1058,7 +1058,8 @@ class ConfLoss(MultiLoss):
             conf_loss = conf_loss.mean() if conf_loss.numel() > 0 else 0
             conf_losses.append(conf_loss)
 
-            details[self.get_name() + f"_conf_loss/{img_ids[i] + 1}"] = float(conf_loss)
+            self_name = type(self).__name__
+            details[self_name + f"_conf_loss/{img_ids[i] + 1}"] = float(conf_loss)
 
         details.pop("img_ids", None)
 

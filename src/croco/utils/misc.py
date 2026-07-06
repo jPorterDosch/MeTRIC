@@ -13,12 +13,12 @@
 import builtins
 import datetime
 import os
+import re
 import time
 import math
 import json
 from collections import defaultdict, deque
 from pathlib import Path
-import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -129,7 +129,13 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def log_every(
-        self, iterable, print_freq, accelerator: Accelerator, header=None, max_iter=None, start_step=0,
+        self,
+        iterable,
+        print_freq,
+        accelerator: Accelerator,
+        header=None,
+        max_iter=None,
+        start_step=0,
     ):
         i = 0
         if not header:
@@ -198,6 +204,31 @@ class MetricLogger(object):
                     header, total_time_str, total_time / len_iterable
                 )
             )
+
+
+_PER_VIEW_METRIC_RE = re.compile(r"^(?P<base>.+)/(?P<idx>\d+)(?P<suffix>_avg|_med)?$")
+
+
+def aggregate_per_view_metrics(items: dict) -> dict:
+    """Collapse per-view/per-image metrics (e.g. "Regr3DPose_pts3d/2", or
+    "Regr3DPose_pts3d/2_avg" from test-time aggregation) into a single averaged
+    entry ("Regr3DPose_pts3d", "Regr3DPose_pts3d_avg"). The view index isn't a
+    stable identity across batches (views are shuffled per batch), so tracking
+    one series per index is just noise - this reports one series per loss term
+    instead. Keys that don't match the pattern pass through unchanged.
+    """
+    grouped = {}
+    passthrough = {}
+    for key, val in items.items():
+        m = _PER_VIEW_METRIC_RE.match(key)
+        if m:
+            grouped.setdefault(m.group("base") + (m.group("suffix") or ""), []).append(
+                val
+            )
+        else:
+            passthrough[key] = val
+    aggregated = {k: sum(vs) / len(vs) for k, vs in grouped.items()}
+    return {**passthrough, **aggregated}
 
 
 def setup_for_distributed(is_master):
@@ -437,17 +468,19 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
                 args.resume, map_location="cpu", check_hash=True
             )
         else:
-            checkpoint = torch.load(args.resume, map_location="cuda", weights_only=False)
+            checkpoint = torch.load(
+                args.resume, map_location="cuda", weights_only=False
+            )
         printer.info("Resume checkpoint %s" % args.resume)
         state_dict = checkpoint["model"]
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         model_without_ddp.load_state_dict(new_state_dict, strict=True)
         args.start_epoch = checkpoint["epoch"] + 1
         if "step" in checkpoint:
             args.start_step = checkpoint["step"]
         device = next(model_without_ddp.parameters()).device
         printer.info(f"Moving optimizer state to device: {device}")
-        
+
         if "optimizer" in checkpoint:
             for state in checkpoint["optimizer"]["state"].values():
                 for k, v in state.items():
