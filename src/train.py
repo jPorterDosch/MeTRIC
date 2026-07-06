@@ -48,7 +48,6 @@ printer = get_logger(__name__, log_level="DEBUG")
 
 WANDB_PROJECT = "MeTRIC"
 WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
-WANDB_MODE = "offline"
 
 
 def setup_for_distributed(accelerator: Accelerator):
@@ -120,7 +119,6 @@ def train(args):
     wandb_init_kwargs = {
         "name": args.exp_name,
         "dir": args.output_dir,
-        "mode": WANDB_MODE,
     }
     if WANDB_ENTITY:
         wandb_init_kwargs["entity"] = WANDB_ENTITY
