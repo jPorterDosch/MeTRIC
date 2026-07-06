@@ -1,5 +1,8 @@
 # %%
 #!/usr/bin/python
+import glob
+import os
+import shutil
 
 from PIL import Image
 import numpy as np
@@ -18,11 +21,6 @@ def depth_read(filename):
     depth[depth_png == 0] = -1.0
     return depth
 
-
-# %%
-import glob
-import os
-import shutil
 
 depth_dirs = glob.glob(
     os.path.expanduser("~/scratch/data/kitti/val/*/proj_depth/groundtruth/image_02")

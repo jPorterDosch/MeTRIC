@@ -3,6 +3,8 @@ import glob
 import os
 import shutil
 
+import numpy as np
+
 dirs = glob.glob(os.path.expanduser("~/scratch/data/bonn/rgbd_bonn_dataset/*/"))
 dirs = sorted(dirs)
 # extract frames
@@ -30,7 +32,6 @@ for dir in dirs:
         os.makedirs(new_dir, exist_ok=True)
         shutil.copy(frame, new_dir)
         # print(f'cp {frame} {new_dir}')
-import numpy as np
 
 for dir in dirs:
     gt_path = "groundtruth.txt"
