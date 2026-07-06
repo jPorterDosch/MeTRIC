@@ -2,8 +2,6 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import math
-import cv2
 import numpy as np
 import torch
 import argparse
@@ -152,7 +150,9 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     ) = prepare_output(outputs)
 
                     os.makedirs(f"{save_dir}/{seq}", exist_ok=True)
-                    save_depth_maps(pts3ds_self, f"{save_dir}/{seq}", conf_self=conf_self)
+                    save_depth_maps(
+                        pts3ds_self, f"{save_dir}/{seq}", conf_self=conf_self
+                    )
 
             except Exception as e:
                 if "out of memory" in str(e):
@@ -180,15 +180,8 @@ if __name__ == "__main__":
     args = args.parse_args()
     add_path_to_dust3r(args.weights)
     from dust3r.utils.image import load_images_for_eval as load_images
-    from dust3r.post_process import estimate_focal_knowing_depth
-    from dust3r.model import ARCroco3DStereo
-    from dust3r.utils.camera import pose_encoding_to_camera
 
     from streamvggt.models.streamvggt import StreamVGGT
-    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
-    from streamvggt.utils.geometry import unproject_depth_map_to_point_map
-    from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21
-    from dust3r.utils.geometry import geotrf
     from copy import deepcopy
 
     if args.eval_dataset == "sintel":
@@ -214,7 +207,7 @@ if __name__ == "__main__":
 
             for i in range(num_views):
                 view = {
-                    "img": images[i]["img"].to(device='cuda'),
+                    "img": images[i]["img"].to(device="cuda"),
                     "ray_map": torch.full(
                         (
                             images[i]["img"].shape[0],
@@ -223,21 +216,22 @@ if __name__ == "__main__":
                             images[i]["img"].shape[-1],
                         ),
                         torch.nan,
-                    ).to(device='cuda'),
-                    "true_shape": torch.from_numpy(images[i]["true_shape"]).to(device='cuda'),
+                    ).to(device="cuda"),
+                    "true_shape": torch.from_numpy(images[i]["true_shape"]).to(
+                        device="cuda"
+                    ),
                     "idx": i,
                     "instance": str(i),
-                    "camera_pose": torch.from_numpy(
-                        np.eye(4).astype(np.float32)
-                    ).unsqueeze(0).to(device='cuda'),
-                    "img_mask": torch.tensor(True).unsqueeze(0).to(device='cuda'),
-                    "ray_mask": torch.tensor(False).unsqueeze(0).to(device='cuda'),
-                    "update": torch.tensor(True).unsqueeze(0).to(device='cuda'),
-                    "reset": torch.tensor(False).unsqueeze(0).to(device='cuda'),
+                    "camera_pose": torch.from_numpy(np.eye(4).astype(np.float32))
+                    .unsqueeze(0)
+                    .to(device="cuda"),
+                    "img_mask": torch.tensor(True).unsqueeze(0).to(device="cuda"),
+                    "ray_mask": torch.tensor(False).unsqueeze(0).to(device="cuda"),
+                    "update": torch.tensor(True).unsqueeze(0).to(device="cuda"),
+                    "reset": torch.tensor(False).unsqueeze(0).to(device="cuda"),
                 }
                 views.append(view)
         else:
-
             num_views = len(images) + len(raymaps)
             assert len(img_mask) == len(raymap_mask) == num_views
             assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
@@ -247,29 +241,37 @@ if __name__ == "__main__":
             for i in range(num_views):
                 view = {
                     "img": (
-                        images[j]["img"].to(device='cuda')
+                        images[j]["img"].to(device="cuda")
                         if img_mask[i]
-                        else torch.full_like(images[0]["img"], torch.nan).to(device='cuda')
+                        else torch.full_like(images[0]["img"], torch.nan).to(
+                            device="cuda"
+                        )
                     ),
                     "ray_map": (
-                        raymaps[k].to(device='cuda')
+                        raymaps[k].to(device="cuda")
                         if raymap_mask[i]
-                        else torch.full_like(raymaps[0], torch.nan).to(device='cuda')
+                        else torch.full_like(raymaps[0], torch.nan).to(device="cuda")
                     ),
                     "true_shape": (
-                        torch.from_numpy(images[j]["true_shape"]).to(device='cuda')
+                        torch.from_numpy(images[j]["true_shape"]).to(device="cuda")
                         if img_mask[i]
-                        else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]])).to(device='cuda')
+                        else torch.from_numpy(
+                            np.int32([raymaps[k].shape[1:-1][::-1]])
+                        ).to(device="cuda")
                     ),
                     "idx": i,
                     "instance": str(i),
-                    "camera_pose": torch.from_numpy(
-                        np.eye(4).astype(np.float32)
-                    ).unsqueeze(0).to(device='cuda'),
-                    "img_mask": torch.tensor(img_mask[i]).unsqueeze(0).to(device='cuda'),
-                    "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0).to(device='cuda'),
-                    "update": torch.tensor(img_mask[i]).unsqueeze(0).to(device='cuda'),
-                    "reset": torch.tensor(False).unsqueeze(0).to(device='cuda'),
+                    "camera_pose": torch.from_numpy(np.eye(4).astype(np.float32))
+                    .unsqueeze(0)
+                    .to(device="cuda"),
+                    "img_mask": torch.tensor(img_mask[i])
+                    .unsqueeze(0)
+                    .to(device="cuda"),
+                    "ray_mask": torch.tensor(raymap_mask[i])
+                    .unsqueeze(0)
+                    .to(device="cuda"),
+                    "update": torch.tensor(img_mask[i]).unsqueeze(0).to(device="cuda"),
+                    "reset": torch.tensor(False).unsqueeze(0).to(device="cuda"),
                 }
                 if img_mask[i]:
                     j += 1
