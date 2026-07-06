@@ -206,6 +206,39 @@ fi
 echo "  → Inherited: $INHERITED_ISSUES"
 
 # =============================================================================
+# Precise NEW issue list (for display/annotations only — does NOT affect
+# NEW_ISSUES/pass-fail above, which stays rule-level per the design decision).
+# =============================================================================
+# rules_with_new_issues.txt only says WHICH rule codes regressed repo-wide; it
+# can't say WHICH occurrences are new. Matching by (code, message) with
+# one-for-one cancellation against main's counts is: robust to line-number
+# shifts from unrelated edits above (line/col excluded from the match), and
+# robust to file renames/moves (ConfLoss's dust3r/losses.py -> loss.py move
+# doesn't fool this, since path is excluded from the match too, unlike a
+# file-scoped filter which would misattribute the whole moved file as new).
+jq -n --slurpfile pr "$D/pr_ruff_output.json" --slurpfile main "$D/main_ruff_output.json" '
+  def sig: (.code + "" + .message);
+  ($main | reduce .[] as $m ({}; .[$m|sig] += 1)) as $maincounts
+  | ($pr | map(select(.location == null))) as $no_loc
+  | ($pr
+      | map(select(.location != null))
+      | group_by(sig)
+      | map(
+          . as $grp
+          | ($grp[0]|sig) as $key
+          | ($maincounts[$key] // 0) as $mc
+          | ($grp | sort_by(.filename, .location.row, .location.column)) as $sorted
+          | if ($sorted|length) > $mc then $sorted[$mc:] else [] end
+        )
+      | flatten
+    ) as $new_with_loc
+  | ($no_loc + $new_with_loc)
+' > "$D/new_issues_precise.json" 2>/dev/null || echo '[]' > "$D/new_issues_precise.json"
+
+PRECISE_NEW_COUNT=$(jq 'length' "$D/new_issues_precise.json" 2>/dev/null || echo 0)
+echo "  → Precise new-issue occurrences (for annotations): $PRECISE_NEW_COUNT"
+
+# =============================================================================
 # Calculate Deltas
 # =============================================================================
 DELTA=$((PR_TOTAL - MAIN_TOTAL))
