@@ -4,7 +4,6 @@
 # References:
 # DUSt3R: https://github.com/naver/dust3r
 # --------------------------------------------------------
-import argparse
 import datetime
 import json
 import numpy as np
@@ -12,39 +11,25 @@ import os
 import sys
 import time
 import math
-from collections import defaultdict
 from pathlib import Path
 from typing import Sized
-from itertools import islice
 
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
-from dust3r.model import (
-    PreTrainedModel,
-    ARCroco3DStereo,
-    ARCroco3DStereoConfig,
-    inf,
-    strip_module,
-)  # noqa: F401, needed when loading the model
 from dust3r.datasets import get_data_loader
-from dust3r.losses import *  # noqa: F401, needed when loading the model
+from streamvggt.loss.loss import *  # noqa: F401, needed when loading the model
 from dust3r.inference import loss_of_one_batch  # noqa
-from dust3r.viz import colorize
-from dust3r.utils.render import get_render_results
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 import hydra
 from omegaconf import OmegaConf
-import logging
 import pathlib
-from tqdm import tqdm
 import random
 import builtins
 import shutil
@@ -134,7 +119,7 @@ def train(args):
 
     # auto resume
     if not args.resume:
-        last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
+        last_ckpt_fname = os.path.join(args.output_dir, "checkpoint-last.pth")
         args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 
     printer.info("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
@@ -158,7 +143,7 @@ def train(args):
         args.num_workers,
         accelerator=accelerator,
         test=False,
-        fixed_length=args.fixed_length
+        fixed_length=args.fixed_length,
     )
     printer.info("Building test dataset %s", args.test_dataset)
     data_loader_test = {
@@ -168,7 +153,7 @@ def train(args):
             args.num_workers,
             accelerator=accelerator,
             test=True,
-            fixed_length=True
+            fixed_length=True,
         )
         for dataset in args.test_dataset.split("+")
     }
@@ -180,7 +165,6 @@ def train(args):
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
-
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
     train_criterion = eval(args.train_criterion).to(device)
@@ -199,9 +183,7 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
+        printer.info(model.load_state_dict(ckpt, strict=True))
         del ckpt  # in case it occupies memory
 
     printer.info("Loading teacher model")
@@ -209,10 +191,9 @@ def train(args):
     teacher.load_state_dict(ckpt_teacher, strict=True)
     teacher = teacher.to("cuda")
     for p in teacher.parameters():
-        p.requires_grad = False  
+        p.requires_grad = False
     teacher.eval()
     del ckpt_teacher
-
 
     # freeze
     printer.info("Freezing patch embedding and positional encoding parameters...")
@@ -225,17 +206,16 @@ def train(args):
         total_params += param.numel()
         param.requires_grad = True
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
+    if hasattr(model, "aggregator") and hasattr(model.aggregator, "patch_embed"):
         for param in model.aggregator.patch_embed.parameters():
             if param.requires_grad:
                 param.requires_grad = False
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'camera_token'):
+    if hasattr(model, "aggregator") and hasattr(model.aggregator, "camera_token"):
         model.aggregator.camera_token.requires_grad = False
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'register_token'):
+    if hasattr(model, "aggregator") and hasattr(model.aggregator, "register_token"):
         model.aggregator.register_token.requires_grad = False
-
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -243,14 +223,15 @@ def train(args):
             frozen_param_names.append(name)
 
     printer.info(
-        f"Frozen {frozen_params:,} parameters out of {total_params:,} total parameters. ({frozen_params / total_params:.2%})")
+        f"Frozen {frozen_params:,} parameters out of {total_params:,} total parameters. ({frozen_params / total_params:.2%})"
+    )
     printer.info(
-        f"Trainable parameters: {total_params - frozen_params:,} ({(total_params - frozen_params) / total_params:.2%})")
+        f"Trainable parameters: {total_params - frozen_params:,} ({(total_params - frozen_params) / total_params:.2%})"
+    )
     if frozen_param_names:
         printer.info(
-            f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
-
-
+            f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}"
+        )
 
     # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -311,7 +292,6 @@ def train(args):
     train_stats = test_stats = {}
 
     for epoch in range(args.start_epoch, args.epochs + 1):
-
         # Save immediately the last checkpoint
         if epoch > args.start_epoch:
             if (
@@ -331,7 +311,6 @@ def train(args):
         if epoch >= args.epochs:
             break  # exit after writing last test to disk
 
-
         # Train
         train_stats = train_one_epoch(
             model,
@@ -343,9 +322,8 @@ def train(args):
             epoch,
             loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
         )
-
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -372,7 +350,9 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
     misc.save_on_master(accelerator, to_save, checkpoint_path)
 
 
-def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
+def build_dataset(
+    dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False
+):
     split = ["Train", "Test"][test]
     printer.info(f"Building {split} Data loader for dataset: {dataset}")
     loader = get_data_loader(
@@ -383,7 +363,7 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
         shuffle=not (test),
         drop_last=not (test),
         accelerator=accelerator,
-        fixed_length=fixed_length
+        fixed_length=fixed_length,
     )
     return loader
 
@@ -434,20 +414,22 @@ def train_one_epoch(
     ):
         data_loader.batch_sampler.batch_sampler.set_epoch(epoch)
 
-
     optimizer.zero_grad()
 
     start_step = args.start_step
 
-    data_iter = metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
+    data_iter = metric_logger.log_every(
+        data_loader, args.print_freq, accelerator, header
+    )
 
     for data_iter_step, batch in enumerate(data_iter):
-            
         with accelerator.accumulate(model):
             # change the range of the image to [0, 1]
             if isinstance(batch, dict) and "img" in batch:
                 batch["img"] = (batch["img"] + 1.0) / 2.0
-            elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
+            elif isinstance(batch, list) and all(
+                isinstance(v, dict) and "img" in v for v in batch
+            ):
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
 
@@ -469,7 +451,7 @@ def train_one_epoch(
                 symmetrize_batch=False,
                 use_amp=bool(args.amp),
             )
-      
+
             loss, loss_details = result["loss"]  # criterion returns two values
 
             loss_value = float(loss)
@@ -493,7 +475,7 @@ def train_one_epoch(
             curr_num_view = len(batch)
 
             del loss
-            
+
             tb_vis_img = (data_iter_step + 1) % accum_iter == 0 and (
                 (step + 1) % (args.print_img_freq)
             ) == 0
@@ -545,6 +527,7 @@ def train_one_epoch(
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
 
 def batch_append(original_list, new_list):
     for sublist, new_item in zip(original_list, new_list):
