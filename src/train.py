@@ -16,7 +16,6 @@ from typing import Sized
 
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -332,7 +331,7 @@ def train(args):
             accelerator,
             epoch,
             loss_scaler,
-            args=args
+            args=args,
         )
 
     total_time = time.time() - start_time

@@ -21,7 +21,9 @@ def get_parser():
     )
     parser.add_argument(
         "--precomputed_pairs",
-        default=os.path.expanduser("~/scratch/data/dust3r_data/data_arkitscenes/arkitscenes_pairs"),
+        default=os.path.expanduser(
+            "~/scratch/data/dust3r_data/data_arkitscenes/arkitscenes_pairs"
+        ),
     )
     parser.add_argument(
         "--output_dir",
