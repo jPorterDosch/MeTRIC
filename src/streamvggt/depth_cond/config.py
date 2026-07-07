@@ -162,17 +162,22 @@ class MetricCfg:
 # ---------------------------------------------------------------------------
 # Experiment identity.
 #
-# A canonical SHA over the config names the experiment: the entrypoint derives
-# the save directory from it and fails fast on a directory collision, so a
-# finished experiment is never silently re-run. The manifest is also written
-# to disk and to wandb, where callers can filter runs for comparisons
-# (e.g. selecting head-vs-token pairs that agree on every other knob).
+# manifest = the flattened config itself, minus an explicit blacklist of
+# fields that don't change the trained model (save paths, logging cadence).
+# hash = SHA-256 over the manifest. The hash names the experiment and its
+# save directory; the entrypoint fails fast on a directory collision, so a
+# finished experiment is never silently re-run. The manifest is written to
+# disk and to wandb, where callers filter runs for comparisons (e.g.
+# head-vs-token pairs that agree on every other knob).
 # ---------------------------------------------------------------------------
 
 
-def experiment_manifest(cfg: MetricCfg) -> dict:
-    """Flat, JSON-serializable manifest of every conditioning/LoRA/cache/train knob."""
+def experiment_manifest(cfg, exclude: tuple[str, ...] = ()) -> dict:
+    """Flatten any config dataclass into a JSON-serializable {dotted.key: value}
+    dict, dropping the blacklisted top-level field names in `exclude`."""
     d = dataclasses.asdict(cfg)
+    for k in exclude:
+        d.pop(k, None)
     flat: dict = {}
 
     def _flatten(prefix: str, obj: dict) -> None:

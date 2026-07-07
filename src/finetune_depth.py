@@ -118,59 +118,43 @@ class FinetuneDepthCfg:
     output_dir: str = ""
 
 
-# Trainer fields that define the experiment (hashed alongside the MetricCfg
-# manifest). Deliberately excludes output naming, logging cadence, and worker
-# counts, which do not change the trained model.
-_HASHED_TRAINER_FIELDS = (
-    "pretrained",
-    "seed",
-    "batch_size",
-    "accum_iter",
-    "epochs",
-    "weight_decay",
-    "lr",
-    "min_lr",
-    "warmup_epochs",
-    "amp",
-    "num_views",
-    "fixed_length",
-    "train_dataset",
-    "train_criterion",
+# Blacklist: the only fields that do NOT define the experiment (output naming,
+# logging cadence, worker counts, resume bookkeeping). Everything else in the
+# config -- nested depth_cond/lora/cache/train blocks included -- is hashed.
+_NON_IDENTITY_FIELDS = (
+    "save_dir",
+    "exp_name",
+    "output_dir",
+    "resume",
+    "start_epoch",
+    "start_step",
+    "print_freq",
+    "save_freq",
+    "keep_freq",
+    "num_workers",
+    "benchmark",
 )
 
 
-def build_manifest(cfg: FinetuneDepthCfg, mcfg: MetricCfg) -> dict:
-    manifest = experiment_manifest(mcfg)
-    for f in _HASHED_TRAINER_FIELDS:
-        manifest[f"trainer.{f}"] = getattr(cfg, f)
-    return manifest
+def build_manifest(cfg: FinetuneDepthCfg) -> dict:
+    return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
 
 
 def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
-    """Derive the save directory from the experiment hash and fail fast on
-    collisions: a completed experiment is never silently re-run; an
-    interrupted one auto-resumes from its last checkpoint."""
+    """Derive the save directory (<save_dir>/<exp_name>_<hash>) and fail fast
+    if it already exists: an experiment with this exact config has been run or
+    is running, and silently re-running it would waste the compute. To resume
+    an interrupted run, pass --resume <path/to/checkpoint-last.pth> explicitly."""
     output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_hash[:10]}")
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    final_ckpt = os.path.join(output_dir, "checkpoint-final.pth")
-    last_ckpt = os.path.join(output_dir, "checkpoint-last.pth")
-    if os.path.isfile(manifest_path):
-        if os.path.isfile(final_ckpt):
-            raise RuntimeError(
-                f"Experiment {run_hash[:10]} already completed in {output_dir} "
-                f"({final_ckpt} exists). Refusing to re-run; change the config "
-                "or remove the directory deliberately."
-            )
-        if os.path.isfile(last_ckpt):
-            printer.info(
-                f"Found interrupted run in {output_dir}; resuming from {last_ckpt}"
-            )
-            cfg.resume = last_ckpt
-        else:
-            raise RuntimeError(
-                f"Output dir {output_dir} exists (same experiment hash) but has no "
-                "checkpoint to resume from. Remove it to re-launch this experiment."
-            )
+    if cfg.resume:
+        return output_dir
+    if os.path.exists(output_dir):
+        raise RuntimeError(
+            f"Output dir {output_dir} already exists: an experiment with this exact "
+            "config hash has already been launched. Refusing to re-run. Either change "
+            f"the config, pass --resume {os.path.join(output_dir, 'checkpoint-last.pth')} "
+            "to continue an interrupted run, or remove the directory deliberately."
+        )
     return output_dir
 
 
@@ -460,7 +444,7 @@ def main(cfg: FinetuneDepthCfg) -> None:
         train=cfg.train,
     ).validate()
 
-    manifest = build_manifest(cfg, mcfg)
+    manifest = build_manifest(cfg)
     run_hash = experiment_hash(manifest)
     cfg.output_dir = resolve_output_dir(cfg, run_hash)
     print(f"Experiment {cfg.exp_name} hash {run_hash[:10]} -> {cfg.output_dir}")

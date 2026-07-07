@@ -137,12 +137,16 @@ class MetricStreamVGGT(nn.Module):
         depths, masks = [], []
         for view in views:
             if "sparse_depth" in view:
+                if "sparse_depth_mask" not in view:
+                    # the validity mask is load-bearing (it is how the model
+                    # tells "0 m reading" from "no measurement"); deriving it
+                    # from depth>0 would silently conflate the two
+                    raise ValueError(
+                        "view has 'sparse_depth' but no 'sparse_depth_mask'; "
+                        "pass the validity mask explicitly"
+                    )
                 d = view["sparse_depth"]
-                m = (
-                    view["sparse_depth_mask"]
-                    if "sparse_depth_mask" in view
-                    else (d > 0).to(d.dtype)
-                )
+                m = view["sparse_depth_mask"]
             else:
                 d = images.new_zeros(B, H, W)
                 m = images.new_zeros(B, H, W)

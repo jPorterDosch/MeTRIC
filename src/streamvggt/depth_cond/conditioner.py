@@ -219,8 +219,13 @@ class DepthConditioner(nn.Module):
         """
         mask = mask.to(dtype=depth.dtype)
         disp = 1.0 / depth.clamp(min=1e-3)
-        if self.cfg.norm == NormType.FIXED:
-            disp = disp * self.cfg.norm_constant_m  # disp / (1 / norm_constant_m)
+        match self.cfg.norm:
+            case NormType.FIXED:
+                disp = disp * self.cfg.norm_constant_m  # disp / (1 / norm_constant_m)
+            case NormType.RAW:
+                pass  # raw metric disparity, no scaling
+            case _:
+                raise ValueError(f"unhandled norm type: {self.cfg.norm!r}")
         if self.cfg.log_depth:
             disp = torch.log1p(disp)
         disp = disp * mask  # a hole and a zero reading must never look the same:
@@ -284,11 +289,20 @@ class DepthConditioner(nn.Module):
                     # channel 1 the validity
                     pooled, frac = masked_downsample(flat[:, 0:1], flat[:, 1:2], out_hw)
                     scale_inputs.append(torch.cat([pooled, frac], dim=1))
-                case _:
+                case EncoderType.CONV:
+                    # learned dense latent: channels are no longer a
+                    # (signal, mask) pair, so resize instead of masked-pool
                     scale_inputs.append(
                         F.interpolate(
                             flat, size=out_hw, mode="bilinear", align_corners=False
                         )
+                    )
+                case _:
+                    # new EncoderType members must be threaded here explicitly
+                    # (decide: masked pooling or latent resize?)
+                    raise ValueError(
+                        f"no head-arm per-scale projection defined for encoder "
+                        f"{self.cfg.encoder!r}"
                     )
         out: dict[str, list[torch.Tensor] | None] = {h.value: None for h in HeadType}
         for head, convs in self.head_convs.items():
@@ -305,8 +319,17 @@ class DepthConditioner(nn.Module):
         zero-init scalar, to be added residually to the RGB patch tokens."""
         B, S = x.shape[:2]
         flat = x.flatten(0, 1)  # [B*S, C, h, w]
-        if self.encoder is None:
-            flat = F.pixel_unshuffle(flat, self.patch_size)  # [B*S, 2*ps^2, ph, pw]
+        match self.cfg.encoder:
+            case EncoderType.IDENTITY:
+                # raw full-res map: fold patches into channels to reach the patch grid
+                flat = F.pixel_unshuffle(flat, self.patch_size)  # [B*S, 2*ps^2, ph, pw]
+            case EncoderType.CONV:
+                pass  # conv stem already produced a patch-grid latent
+            case _:
+                # new EncoderType members must be threaded here explicitly
+                raise ValueError(
+                    f"no token-arm projection input defined for encoder {self.cfg.encoder!r}"
+                )
         y = self.token_proj(flat)  # [B*S, token_dim, ph, pw]
         y = y.flatten(2).transpose(1, 2)  # [B*S, P_patch, token_dim]
         y = self.gate * y
