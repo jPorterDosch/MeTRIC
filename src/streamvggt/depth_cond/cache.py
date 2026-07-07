@@ -23,10 +23,12 @@ class EncoderFeatureCache:
         os.makedirs(cache_dir, exist_ok=True)
 
     def _path(self, key: str) -> str:
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)
-        if len(safe) > 120:
-            safe = safe[:80] + "_" + hashlib.sha1(key.encode()).hexdigest()[:16]
-        return os.path.join(self.dir, safe + ".pt")
+        # The readable prefix is lossy (distinct keys can sanitize identically,
+        # e.g. 'a/b' and 'a_b'), so a digest of the RAW key is always appended:
+        # filename uniqueness must never depend on the sanitization.
+        digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:80]
+        return os.path.join(self.dir, f"{safe}_{digest}.pt")
 
     def has(self, key: str) -> bool:
         return os.path.isfile(self._path(key))
