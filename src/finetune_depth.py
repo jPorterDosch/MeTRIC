@@ -304,6 +304,7 @@ def train(
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs + 1):
+        # For fractional start_epoch, this will fire every epoch: this is intentional, want to frequently save for long epochs in case of crash.
         if epoch > args.start_epoch:
             if (
                 args.save_freq
