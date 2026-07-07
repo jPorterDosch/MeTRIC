@@ -103,12 +103,22 @@ class MetricStreamVGGT(nn.Module):
 
     def freeze_for_finetune(self) -> dict:
         """Freeze everything except: LoRA adapters (the base projections stay
-        frozen -- wrapping != unfreezing) and the DepthConditioner (which owns
-        all new output-head channels / zero-init convs / gate). The pretrained
-        DPT heads themselves stay frozen by design: the conditioner's zero-init
-        convs are the trainable 'new channels' of those heads."""
+        frozen -- wrapping != unfreezing), the DepthConditioner (zero-init
+        convs / gate / encoder), and the output heads named in
+        train.train_heads -- unfrozen in BOTH injection arms so the heads can
+        learn to emit metric-scaled output (the knob is part of the hashed
+        manifest, keeping the arms comparable)."""
         for name, p in self.model.named_parameters():
             p.requires_grad = ("lora_A" in name) or ("lora_B" in name)
+        for head in self.cfg.train.train_heads:
+            head_module = getattr(self.model, f"{head.value}_head", None)
+            if head_module is None:
+                raise ValueError(
+                    f"train.train_heads includes {head.value!r} but "
+                    f"model.{head.value}_head is None; it cannot be trained"
+                )
+            for p in head_module.parameters():
+                p.requires_grad = True
         if self.conditioner is not None:
             for p in self.conditioner.parameters():
                 p.requires_grad = True

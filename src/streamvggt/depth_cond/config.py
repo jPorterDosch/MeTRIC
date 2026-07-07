@@ -143,6 +143,16 @@ class EncoderCacheCfg:
 class TrainCondCfg:
     grad_checkpoint: bool = True
     clip_len: int | None = 10  # repo default: num_views=10 in config/finetune.yaml
+    # Output heads to fully unfreeze during fine-tuning, in BOTH injection
+    # arms (the arms stay comparable because this knob is part of the hashed
+    # manifest). The pretrained heads must be free to move for the output to
+    # become metric; camera/track heads stay frozen (out of scope).
+    train_heads: list[HeadType] = field(
+        default_factory=lambda: [HeadType.DEPTH, HeadType.POINT]
+    )
+
+    def validate(self) -> None:
+        self.train_heads = [HeadType(h) for h in self.train_heads]
 
 
 @dataclass
@@ -156,6 +166,7 @@ class MetricCfg:
         self.depth_cond.validate()
         self.lora.validate()
         self.encoder_cache.validate()
+        self.train.validate()
         return self
 
 
