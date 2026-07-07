@@ -27,7 +27,7 @@ import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 import hydra
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
@@ -36,6 +36,7 @@ from datetime import timedelta
 import torch.multiprocessing
 
 from streamvggt.depth_cond import (
+    MetricCfg,
     MetricStreamVGGT,
     assert_confound_rule,
     build_metric_cfg,
@@ -59,7 +60,12 @@ WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
 # ---------------------------------------------------------------------------
 
 
-def build_model(args, mcfg, device, load_pretrained=True):
+def build_model(
+    args: DictConfig,
+    mcfg: MetricCfg,
+    device: torch.device,
+    load_pretrained: bool = True,
+) -> tuple[MetricStreamVGGT, dict]:
     model = MetricStreamVGGT(mcfg)
     if load_pretrained and args.pretrained and not args.resume:
         print(f"Loading pretrained StreamVGGT: {args.pretrained}")
@@ -74,11 +80,13 @@ def build_model(args, mcfg, device, load_pretrained=True):
         f"Params: total {stats['total_params']:,} | trainable {stats['trainable_params']:,} "
         f"({stats['trainable_pct']:.3f}%) | base attention frozen: {stats['base_attention_frozen']}"
     )
-    assert stats["base_attention_frozen"], "base attention projections must stay frozen"
+    if not stats["base_attention_frozen"]:
+        raise RuntimeError("base attention projections must stay frozen")
+
     return model, stats
 
 
-def write_manifest_and_check(args, mcfg):
+def write_manifest_and_check(args: DictConfig, mcfg: MetricCfg) -> dict:
     manifest = experiment_manifest(mcfg)
     manifest["_comparable_hash"] = manifest_comparable_hash(mcfg)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -109,7 +117,14 @@ def write_manifest_and_check(args, mcfg):
 # ---------------------------------------------------------------------------
 
 
-def make_synthetic_clip(num_views, B=1, H=154, W=140, device="cuda", seed=0):
+def make_synthetic_clip(
+    num_views: int,
+    B: int = 1,
+    H: int = 154,
+    W: int = 140,
+    device: str | torch.device = "cuda",
+    seed: int = 0,
+) -> list[dict]:
     """A geometrically consistent synthetic clip: smooth RGB, metric depth,
     identity poses, pinhole intrinsics, pts3d by unprojection."""
     g = torch.Generator().manual_seed(seed)
@@ -146,7 +161,7 @@ def make_synthetic_clip(num_views, B=1, H=154, W=140, device="cuda", seed=0):
     return views
 
 
-def run_smoke(args, mcfg):
+def run_smoke(args: DictConfig, mcfg: MetricCfg) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -212,7 +227,7 @@ def run_smoke(args, mcfg):
 # ---------------------------------------------------------------------------
 
 
-def train(args, mcfg):
+def train(args: DictConfig, mcfg: MetricCfg) -> None:
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
@@ -286,7 +301,9 @@ def train(args, mcfg):
         optimizer, model, data_loader_train
     )
 
-    def save_model(epoch, fname, best_so_far, data_iter_step):
+    def save_model(
+        epoch: int, fname: str, best_so_far: float, data_iter_step: int
+    ) -> None:
         misc.save_model(
             accelerator=accelerator,
             args=args,
@@ -349,11 +366,12 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     accelerator: Accelerator,
     epoch: int,
-    loss_scaler,
-    args,
-    mcfg,
-):
-    assert torch.backends.cuda.matmul.allow_tf32 == True  # noqa: E712
+    loss_scaler: NativeScaler,
+    args: DictConfig,
+    mcfg: MetricCfg,
+) -> dict:
+    if not torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError("TF32 matmul must stay enabled (set at module import)")
 
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -453,7 +471,7 @@ def train_one_epoch(
     config_path=str(os.path.dirname(os.path.abspath(__file__))) + "/../config",
     config_name="finetune_depth.yaml",
 )
-def run(cfg: OmegaConf):
+def run(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     logdir = pathlib.Path(cfg.logdir)
     logdir.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,7 @@ import torch
 
 
 class EncoderFeatureCache:
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str) -> None:
         self.dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -38,7 +38,7 @@ class EncoderFeatureCache:
         t = torch.load(p, map_location=device if device is not None else "cpu")
         return t
 
-    def save(self, key: str, feats: torch.Tensor):
+    def save(self, key: str, feats: torch.Tensor) -> None:
         # atomic write: partial files must never be readable as cache hits
         p = self._path(key)
         tmp = p + ".tmp"

@@ -8,7 +8,7 @@ not dataset generation: it runs on already-loaded batches.
 import torch
 
 
-def simulate_sparse_depth(views, num_points: int):
+def simulate_sparse_depth(views: list[dict], num_points: int) -> list[dict]:
     """For each view dict with a dense 'depthmap' [B,H,W] and no 'sparse_depth',
     sample up to num_points valid pixels per sample. Adds in place:
       view['sparse_depth']      [B,H,W]  (0 where not sampled)

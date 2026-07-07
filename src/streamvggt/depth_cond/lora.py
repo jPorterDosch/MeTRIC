@@ -26,7 +26,7 @@ class _LoRABranch(nn.Module):
 
     def __init__(
         self, in_dim: int, out_dim: int, rank: int, alpha: float, dropout: float
-    ):
+    ) -> None:
         super().__init__()
         self.lora_A = nn.Parameter(torch.empty(rank, in_dim))
         self.lora_B = nn.Parameter(torch.zeros(out_dim, rank))
@@ -51,11 +51,15 @@ class LoRAQKV(nn.Module):
         rank: int,
         alpha: float,
         dropout: float,
-    ):
+    ) -> None:
         super().__init__()
         self.base = base
         self.dim = base.in_features
-        assert base.out_features == 3 * self.dim, "expected fused qkv linear"
+        if base.out_features != 3 * self.dim:
+            raise ValueError(
+                f"expected fused qkv linear (out_features == 3 * in_features), "
+                f"got {base.in_features} -> {base.out_features}"
+            )
         self.targets = [t for t in targets if t in _QKV_INDEX]
         self.adapters = nn.ModuleDict(
             {
@@ -75,7 +79,9 @@ class LoRAQKV(nn.Module):
 class LoRALinear(nn.Module):
     """Standard LoRA wrapper around a frozen nn.Linear (used for the 'o' proj)."""
 
-    def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float):
+    def __init__(
+        self, base: nn.Linear, rank: int, alpha: float, dropout: float
+    ) -> None:
         super().__init__()
         self.base = base
         self.adapter = _LoRABranch(

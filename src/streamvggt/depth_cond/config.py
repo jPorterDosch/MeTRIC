@@ -51,7 +51,7 @@ class DepthCondCfg:
     # sparse-depth simulation from GT depthmaps during training
     sim_num_points: int = 512
 
-    def validate(self):
+    def validate(self) -> None:
         if self.encoder not in VALID_ENCODERS:
             raise ValueError(
                 f"depth_cond.encoder must be one of {VALID_ENCODERS}, got {self.encoder!r}"
@@ -96,7 +96,7 @@ class LoRACfg:
     alpha: float = 32.0
     dropout: float = 0.0
 
-    def validate(self):
+    def validate(self) -> None:
         for t in self.targets:
             if t not in VALID_LORA_TARGETS:
                 raise ValueError(
@@ -111,7 +111,7 @@ class EncoderCacheCfg:
     enabled: bool = False
     dir: str = ""
 
-    def validate(self):
+    def validate(self) -> None:
         if self.enabled and not self.dir:
             raise ValueError("encoder_cache.enabled=True requires encoder_cache.dir")
 
@@ -121,7 +121,7 @@ class TrainCondCfg:
     grad_checkpoint: bool = True
     clip_len: Optional[int] = 10  # repo default: num_views=10 in config/finetune.yaml
 
-    def validate(self):
+    def validate(self) -> None:
         pass
 
 
@@ -132,7 +132,7 @@ class MetricCfg:
     encoder_cache: EncoderCacheCfg = field(default_factory=EncoderCacheCfg)
     train: TrainCondCfg = field(default_factory=TrainCondCfg)
 
-    def validate(self):
+    def validate(self) -> "MetricCfg":
         self.depth_cond.validate()
         self.lora.validate()
         self.encoder_cache.validate()
@@ -198,7 +198,7 @@ def experiment_manifest(cfg: MetricCfg) -> dict:
     d = dataclasses.asdict(cfg)
     flat = {}
 
-    def _flatten(prefix, obj):
+    def _flatten(prefix: str, obj: dict) -> None:
         for k, v in obj.items():
             key = f"{prefix}.{k}" if prefix else k
             if isinstance(v, dict):
@@ -224,7 +224,7 @@ class ConfoundError(RuntimeError):
     pass
 
 
-def assert_confound_rule(manifest_a: dict, manifest_b: dict):
+def assert_confound_rule(manifest_a: dict, manifest_b: dict) -> None:
     """Fail loudly unless the two manifests differ in nothing but injection."""
     keys = set(manifest_a) | set(manifest_b)
     diffs = []

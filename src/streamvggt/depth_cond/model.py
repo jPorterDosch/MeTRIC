@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from streamvggt.models.streamvggt import StreamVGGT
+from streamvggt.models.streamvggt import StreamVGGT, StreamVGGTOutput
 
 from .cache import EncoderFeatureCache
 from .conditioner import DepthConditioner, dpt_fusion_sizes
@@ -21,7 +21,13 @@ from .lora import apply_lora, param_stats
 
 
 class MetricStreamVGGT(nn.Module):
-    def __init__(self, cfg: MetricCfg, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(
+        self,
+        cfg: MetricCfg,
+        img_size: int = 518,
+        patch_size: int = 14,
+        embed_dim: int = 1024,
+    ) -> None:
         super().__init__()
         cfg.validate()
         self.cfg = cfg
@@ -57,7 +63,9 @@ class MetricStreamVGGT(nn.Module):
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
-    def load_pretrained(self, path: str, map_location="cpu"):
+    def load_pretrained(
+        self, path: str, map_location: str | torch.device = "cpu"
+    ) -> torch.nn.modules.module._IncompatibleKeys:
         """Load the pretrained StreamVGGT checkpoint (raw state_dict) into the
         base model. Must run BEFORE apply_lora_adapters (wrapping renames keys)."""
         if self._lora_applied:
@@ -73,7 +81,7 @@ class MetricStreamVGGT(nn.Module):
             sd = sd["model"]
         return self.model.load_state_dict(sd, strict=True)
 
-    def apply_lora_adapters(self):
+    def apply_lora_adapters(self) -> int:
         if self.cfg.lora.enabled and not self._lora_applied:
             n = apply_lora(self.model.aggregator, self.cfg.lora)
             self._lora_applied = True
@@ -104,7 +112,9 @@ class MetricStreamVGGT(nn.Module):
     # ------------------------------------------------------------------
     # depth gathering
     # ------------------------------------------------------------------
-    def _gather_sparse_depth(self, views, images):
+    def _gather_sparse_depth(
+        self, views: list[dict], images: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Stack per-view sparse depth + validity into [B,S,H,W]. Views without
         sparse depth contribute all-invalid (zero depth, zero mask) frames --
         'no measurement' is representable by construction."""
@@ -124,7 +134,9 @@ class MetricStreamVGGT(nn.Module):
         mask = torch.stack(masks, dim=1)
         return depth, mask
 
-    def _conditioner_outputs(self, views, images):
+    def _conditioner_outputs(
+        self, views: list[dict], images: torch.Tensor
+    ) -> tuple[Optional[torch.Tensor], Optional[dict]]:
         """Returns (depth_token_feats, depth_head_residuals) for this batch."""
         if self.conditioner is None:
             return None, None
@@ -192,7 +204,9 @@ class MetricStreamVGGT(nn.Module):
     # ------------------------------------------------------------------
     # forward / inference
     # ------------------------------------------------------------------
-    def forward(self, views, query_points: torch.Tensor = None):
+    def forward(
+        self, views: list[dict], query_points: Optional[torch.Tensor] = None
+    ) -> "StreamVGGTOutput":
         images = torch.stack([view["img"] for view in views], dim=0).permute(
             1, 0, 2, 3, 4
         )
@@ -208,7 +222,9 @@ class MetricStreamVGGT(nn.Module):
             depth_head_residuals=head_residuals,
         )
 
-    def inference(self, frames, query_points: torch.Tensor = None):
+    def inference(
+        self, frames: list[dict], query_points: Optional[torch.Tensor] = None
+    ) -> "StreamVGGTOutput":
         """Streaming inference: per-frame conditioning (S=1 is the degenerate
         case of the same [B,S,H,W] contract; token feats enter before the KV
         cache each step)."""

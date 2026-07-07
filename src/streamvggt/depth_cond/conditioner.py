@@ -22,8 +22,11 @@ from .config import DepthCondCfg
 
 
 def masked_downsample(
-    disp: torch.Tensor, mask: torch.Tensor, out_hw, eps: float = 1e-6
-):
+    disp: torch.Tensor,
+    mask: torch.Tensor,
+    out_hw: Tuple[int, int],
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Masked average pooling for sparse maps.
 
     Standard average pooling is wrong here: it blends "0 m" with "no
@@ -45,7 +48,7 @@ class ConvDepthEncoder(nn.Module):
     validity) map to the backbone's patch-grid resolution (stride = patch_size),
     following MapAnything's conv depth encoder in spirit."""
 
-    def __init__(self, channels: int, patch_size: int):
+    def __init__(self, channels: int, patch_size: int) -> None:
         super().__init__()
         self.patch_size = patch_size
         self.stem = nn.Conv2d(2, channels, kernel_size=patch_size, stride=patch_size)
@@ -71,7 +74,7 @@ class TemporalAttention(nn.Module):
     so at initialization it is an exact no-op for every S (which subsumes the
     required S=1 no-op)."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
         self.num_heads = 1 if dim < 64 else 4
@@ -105,7 +108,7 @@ class DepthConditioner(nn.Module):
       - injection == "token": {"token_dim": int}
     """
 
-    def __init__(self, cfg: DepthCondCfg, out_spec: dict, patch_size: int = 14):
+    def __init__(self, cfg: DepthCondCfg, out_spec: dict, patch_size: int = 14) -> None:
         super().__init__()
         cfg.validate()
         self.cfg = cfg
@@ -214,7 +217,7 @@ class DepthConditioner(nn.Module):
         depth: torch.Tensor,
         mask: torch.Tensor,
         out_hw_list: Optional[List[Tuple[int, int]]] = None,
-    ):
+    ) -> Dict[str, List[torch.Tensor]] | torch.Tensor:
         """depth, mask: [B,S,H,W].
 
         head arm: requires out_hw_list (spatial size of each DPT fusion scale);
@@ -228,14 +231,16 @@ class DepthConditioner(nn.Module):
             x = self.temporal(x)
 
         if self.injection == "head":
-            assert out_hw_list is not None, (
-                "head injection needs per-scale output sizes"
-            )
+            if out_hw_list is None:
+                raise ValueError(
+                    "head injection needs per-scale output sizes (out_hw_list); "
+                    "compute them with dpt_fusion_sizes(H, W, patch_size)"
+                )
             return self._project_head(x, out_hw_list)
         return self._project_token(x)
 
     def _project_head(
-        self, x: torch.Tensor, out_hw_list
+        self, x: torch.Tensor, out_hw_list: List[Tuple[int, int]]
     ) -> Dict[str, List[torch.Tensor]]:
         B, S = x.shape[:2]
         flat = x.flatten(0, 1)  # [B*S, C, h, w]
