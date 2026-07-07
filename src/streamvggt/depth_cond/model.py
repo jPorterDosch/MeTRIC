@@ -14,7 +14,7 @@ from streamvggt.models.streamvggt import StreamVGGT, StreamVGGTOutput
 
 from .cache import EncoderFeatureCache
 from .conditioner import DepthConditioner, dpt_fusion_sizes
-from .config import InjectionType, MetricCfg
+from .config import HeadType, InjectionType, MetricCfg
 from .lora import apply_lora, param_stats
 
 
@@ -43,12 +43,11 @@ class MetricStreamVGGT(nn.Module):
                     # silently conditioning a dead head would waste an entire
                     # training run before anyone noticed.
                     for head in cfg.depth_cond.heads:
-                        head_module = getattr(self.model, f"{head.value}_head", None)
-                        if head_module is None:
+                        if self._head_module(head) is None:
                             raise ValueError(
-                                f"depth_cond.heads includes {head.value!r} but "
-                                f"model.{head.value}_head is None; this head would "
-                                "never receive gradient signal from the conditioner"
+                                f"depth_cond.heads includes {head.value!r} but the "
+                                "corresponding head module is None; it would never "
+                                "receive gradient signal from the conditioner"
                             )
                     # Read the head geometry from the model, not from constants.
                     ref_head = self.model.depth_head
@@ -74,6 +73,19 @@ class MetricStreamVGGT(nn.Module):
         )
         self.model.aggregator.grad_checkpointing = cfg.train.grad_checkpoint
         self._lora_applied = False
+
+    def _head_module(self, head: HeadType) -> nn.Module | None:
+        """Enum -> head module dispatch. HeadType deliberately covers only the
+        DPT heads that depth conditioning can target/train; the camera and
+        track heads are not addressable here (extend the enum AND this match
+        to change that)."""
+        match head:
+            case HeadType.DEPTH:
+                return self.model.depth_head
+            case HeadType.POINT:
+                return self.model.point_head
+            case _:
+                raise ValueError(f"unhandled head type: {head!r}")
 
     # ------------------------------------------------------------------
     # setup
@@ -111,11 +123,11 @@ class MetricStreamVGGT(nn.Module):
         for name, p in self.model.named_parameters():
             p.requires_grad = ("lora_A" in name) or ("lora_B" in name)
         for head in self.cfg.train.train_heads:
-            head_module = getattr(self.model, f"{head.value}_head", None)
+            head_module = self._head_module(head)
             if head_module is None:
                 raise ValueError(
-                    f"train.train_heads includes {head.value!r} but "
-                    f"model.{head.value}_head is None; it cannot be trained"
+                    f"train.train_heads includes {head.value!r} but the "
+                    "corresponding head module is None; it cannot be trained"
                 )
             for p in head_module.parameters():
                 p.requires_grad = True
