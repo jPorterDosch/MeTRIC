@@ -1,20 +1,25 @@
 from .config import (
     DepthCondCfg,
-    LoRACfg,
     EncoderCacheCfg,
-    TrainCondCfg,
+    EncoderType,
+    HeadType,
+    InjectionType,
+    LoRACfg,
+    LoRATarget,
     MetricCfg,
-    build_metric_cfg,
+    NormType,
+    SparseSimMode,
+    TemporalType,
+    TrainCondCfg,
+    experiment_hash,
     experiment_manifest,
-    manifest_comparable_hash,
-    assert_confound_rule,
-    ConfoundError,
 )
-from .conditioner import DepthConditioner, masked_downsample, dpt_fusion_sizes
-from .lora import apply_lora, LoRAQKV, LoRALinear, param_stats
+from .conditioner import DepthConditioner, dpt_fusion_sizes, masked_downsample
+from .lora import LoRALinear, LoRAQKV, apply_lora, param_stats
 from .cache import EncoderFeatureCache
 from .model import MetricStreamVGGT
 from .sparse import simulate_sparse_depth
+from .utils import seed_everything
 
 __all__ = [
     "DepthCondCfg",
@@ -22,11 +27,15 @@ __all__ = [
     "EncoderCacheCfg",
     "TrainCondCfg",
     "MetricCfg",
-    "build_metric_cfg",
+    "EncoderType",
+    "InjectionType",
+    "TemporalType",
+    "NormType",
+    "HeadType",
+    "LoRATarget",
+    "SparseSimMode",
     "experiment_manifest",
-    "manifest_comparable_hash",
-    "assert_confound_rule",
-    "ConfoundError",
+    "experiment_hash",
     "DepthConditioner",
     "masked_downsample",
     "dpt_fusion_sizes",
@@ -37,4 +46,5 @@ __all__ = [
     "EncoderFeatureCache",
     "MetricStreamVGGT",
     "simulate_sparse_depth",
+    "seed_everything",
 ]

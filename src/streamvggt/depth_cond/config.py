@@ -7,103 +7,126 @@ or temporal setting.
 """
 
 import dataclasses
+import enum
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import List, Optional
 
-VALID_ENCODERS = ("identity", "conv", "mae")
-VALID_INJECTIONS = ("head", "token")
-VALID_TEMPORAL = ("none", "attention")
-VALID_NORMS = ("fixed", "raw")
-VALID_HEADS = ("depth", "point")
-VALID_LORA_TARGETS = ("q", "k", "v", "o")
+
+class EncoderType(str, enum.Enum):
+    IDENTITY = "identity"  # raw passthrough ("naive")
+    CONV = "conv"
+    MAE = "mae"  # stub, not built
+
+
+class InjectionType(str, enum.Enum):
+    HEAD = "head"  # into DPT fusion, post-KV-cache (CONTROL)
+    TOKEN = "token"  # into encoder tokens, pre-KV-cache (PROPOSED)
+
+
+class TemporalType(str, enum.Enum):
+    NONE = "none"
+    ATTENTION = "attention"  # causal self-attention over the S axis
+
+
+class NormType(str, enum.Enum):
+    # Per-frame / per-sample normalization is deliberately NOT representable:
+    # it strips absolute metric scale from the input, the model then sees only
+    # relative structure, and the output silently stops being metric while
+    # still looking plausible. Do not add such a member.
+    FIXED = "fixed"
+    RAW = "raw"
+
+
+class HeadType(str, enum.Enum):
+    DEPTH = "depth"
+    POINT = "point"
+
+
+class LoRATarget(str, enum.Enum):
+    Q = "q"
+    K = "k"
+    V = "v"
+    O = "o"  # noqa: E741 - mirrors the q/k/v/o naming convention
+
+
+class SparseSimMode(str, enum.Enum):
+    NONE = "none"  # no masking: full dense GT depth as conditioning
+    RANDOM = "random"  # MAE-style: random visible patches, resampled per frame
+    TUBE_MASK = "tube_mask"  # one patch mask shared by every frame of the clip
 
 
 @dataclass
 class DepthCondCfg:
     enabled: bool = True
     # AXIS 1: what encodes the depth
-    encoder: str = "identity"  # identity | conv | mae
+    encoder: EncoderType = EncoderType.IDENTITY
     # AXIS 2: where depth is injected
-    injection: str = "token"  # head (CONTROL) | token (PROPOSED)
+    injection: InjectionType = InjectionType.TOKEN
     # AXIS 3: temporal mixing inside the conditioner
-    temporal: str = "none"  # none | attention
+    temporal: TemporalType = TemporalType.NONE
 
-    # depth preprocessing
-    space: str = "disparity"
-    norm: str = (
-        "fixed"  # fixed | raw  (per-frame normalization is FORBIDDEN, see validate())
-    )
+    # depth preprocessing (always disparity space, see conditioner.prepare)
+    norm: NormType = NormType.FIXED
     norm_constant_m: float = 10.0
     log_depth: bool = True
 
     # which DPT heads receive head-injection (head arm only)
-    heads: List[str] = field(default_factory=lambda: ["depth", "point"])
+    heads: list[HeadType] = field(
+        default_factory=lambda: [HeadType.DEPTH, HeadType.POINT]
+    )
 
-    # conv encoder width (encoder == "conv")
+    # conv encoder width (encoder == CONV)
     conv_channels: int = 128
 
     # token arm: residual-add into RGB patch tokens (built). Appending extra
     # tokens is a possible future sub-flag; selecting it raises for now.
     token_append: bool = False
 
-    # sparse-depth simulation from GT depthmaps during training
-    sim_num_points: int = 512
+    # sparse-depth simulation from GT depthmaps during training (sparse.py)
+    sim_mode: SparseSimMode = SparseSimMode.RANDOM
+    sim_patch_size: int = 14
+    sim_mask_ratio: float = 0.95  # fraction of patches masked out (invisible)
 
     def validate(self) -> None:
-        if self.encoder not in VALID_ENCODERS:
-            raise ValueError(
-                f"depth_cond.encoder must be one of {VALID_ENCODERS}, got {self.encoder!r}"
-            )
-        if self.injection not in VALID_INJECTIONS:
-            raise ValueError(
-                f"depth_cond.injection must be one of {VALID_INJECTIONS}, got {self.injection!r}"
-            )
-        if self.temporal not in VALID_TEMPORAL:
-            raise ValueError(
-                f"depth_cond.temporal must be one of {VALID_TEMPORAL}, got {self.temporal!r}"
-            )
-        if self.space != "disparity":
-            raise ValueError("depth_cond.space: only 'disparity' is supported")
-        if self.norm not in VALID_NORMS:
-            # This is deliberate, not an omission: per-frame / per-sample min-max or
-            # max normalization strips absolute metric scale from the input. The model
-            # then sees only relative structure and the output silently stops being
-            # metric while still looking plausible. Do not add such an option.
-            raise ValueError(
-                f"depth_cond.norm must be one of {VALID_NORMS}, got {self.norm!r}. "
-                "Per-frame normalization is forbidden: it destroys the absolute metric "
-                "scale that this whole method exists to inject."
-            )
-        for h in self.heads:
-            if h not in VALID_HEADS:
-                raise ValueError(
-                    f"depth_cond.heads entries must be in {VALID_HEADS}, got {h!r}"
-                )
+        # coerce plain strings (CLI / YAML / tests) to enum members
+        self.encoder = EncoderType(self.encoder)
+        self.injection = InjectionType(self.injection)
+        self.temporal = TemporalType(self.temporal)
+        self.norm = NormType(self.norm)
+        self.heads = [HeadType(h) for h in self.heads]
+        self.sim_mode = SparseSimMode(self.sim_mode)
         if self.token_append:
             raise NotImplementedError(
                 "depth_cond.token_append=True (append extra tokens) is not built; "
                 "the residual-add path is the default. Leave token_append=False."
+            )
+        if not 0.0 <= self.sim_mask_ratio < 1.0:
+            raise ValueError(
+                f"sim_mask_ratio must be in [0, 1), got {self.sim_mask_ratio}"
+            )
+        if self.sim_patch_size <= 0:
+            raise ValueError(
+                f"sim_patch_size must be positive, got {self.sim_patch_size}"
             )
 
 
 @dataclass
 class LoRACfg:
     enabled: bool = True
-    targets: List[str] = field(default_factory=lambda: ["q", "k", "v", "o"])
+    targets: list[LoRATarget] = field(
+        default_factory=lambda: [LoRATarget.Q, LoRATarget.K, LoRATarget.V, LoRATarget.O]
+    )
     rank: int = 16
     alpha: float = 32.0
     dropout: float = 0.0
 
     def validate(self) -> None:
-        for t in self.targets:
-            if t not in VALID_LORA_TARGETS:
-                raise ValueError(
-                    f"lora.targets entries must be in {VALID_LORA_TARGETS}, got {t!r}"
-                )
-        if self.enabled and self.rank <= 0:
-            raise ValueError("lora.rank must be positive")
+        self.targets = [LoRATarget(t) for t in self.targets]
+        # unconditional: a nonsensical rank must never survive into a run,
+        # even one that currently has LoRA disabled
+        if self.rank <= 0:
+            raise ValueError(f"lora.rank must be positive, got {self.rank}")
 
 
 @dataclass
@@ -119,10 +142,7 @@ class EncoderCacheCfg:
 @dataclass
 class TrainCondCfg:
     grad_checkpoint: bool = True
-    clip_len: Optional[int] = 10  # repo default: num_views=10 in config/finetune.yaml
-
-    def validate(self) -> None:
-        pass
+    clip_len: int | None = 10  # repo default: num_views=10 in config/finetune.yaml
 
 
 @dataclass
@@ -136,67 +156,24 @@ class MetricCfg:
         self.depth_cond.validate()
         self.lora.validate()
         self.encoder_cache.validate()
-        self.train.validate()
         return self
 
 
-def _build_section(cls, src) -> object:
-    """Build a dataclass from a dict-like (plain dict or OmegaConf mapping)."""
-    if src is None:
-        return cls()
-    if not isinstance(src, dict):
-        # OmegaConf DictConfig or similar
-        src = {str(k): src[k] for k in src}
-    names = {f.name for f in dataclasses.fields(cls)}
-    unknown = set(src) - names
-    if unknown:
-        raise ValueError(f"Unknown keys for {cls.__name__}: {sorted(unknown)}")
-    kwargs = {}
-    for k, v in src.items():
-        if hasattr(v, "_iter_ex") or (
-            not isinstance(v, (str, bytes, dict)) and hasattr(v, "__iter__")
-        ):
-            v = list(v)
-        kwargs[k] = v
-    return cls(**kwargs)
-
-
-def build_metric_cfg(cfg) -> MetricCfg:
-    """Build a validated MetricCfg from a dict / OmegaConf node with keys
-    depth_cond, lora, encoder_cache, train (all optional)."""
-    get = (
-        (lambda k: cfg.get(k, None))
-        if hasattr(cfg, "get")
-        else (lambda k: getattr(cfg, k, None))
-    )
-    mc = MetricCfg(
-        depth_cond=_build_section(DepthCondCfg, get("depth_cond")),
-        lora=_build_section(LoRACfg, get("lora")),
-        encoder_cache=_build_section(EncoderCacheCfg, get("encoder_cache")),
-        train=_build_section(TrainCondCfg, get("train")),
-    )
-    return mc.validate()
-
-
 # ---------------------------------------------------------------------------
-# The confound rule.
+# Experiment identity.
 #
-# The head-vs-token comparison is only interpretable if everything except
-# depth_cond.injection is identical between the two runs -- in particular the
-# LoRA block. If the token arm trained with different adapters than the head
-# arm, a token win could mean "the decoder was allowed to move differently",
-# not "caching metric scale helped". These helpers make that a hard failure.
+# A canonical SHA over the config names the experiment: the entrypoint derives
+# the save directory from it and fails fast on a directory collision, so a
+# finished experiment is never silently re-run. The manifest is also written
+# to disk and to wandb, where callers can filter runs for comparisons
+# (e.g. selecting head-vs-token pairs that agree on every other knob).
 # ---------------------------------------------------------------------------
-
-# Fields excluded from the comparable manifest: exactly the experimental axis
-# under study, nothing else.
-_CONFOUND_EXEMPT = ("depth_cond.injection",)
 
 
 def experiment_manifest(cfg: MetricCfg) -> dict:
     """Flat, JSON-serializable manifest of every conditioning/LoRA/cache/train knob."""
     d = dataclasses.asdict(cfg)
-    flat = {}
+    flat: dict = {}
 
     def _flatten(prefix: str, obj: dict) -> None:
         for k, v in obj.items():
@@ -204,39 +181,18 @@ def experiment_manifest(cfg: MetricCfg) -> dict:
             if isinstance(v, dict):
                 _flatten(key, v)
             else:
-                flat[key] = list(v) if isinstance(v, (list, tuple)) else v
+                if isinstance(v, (list, tuple)):
+                    v = [x.value if isinstance(x, enum.Enum) else x for x in v]
+                elif isinstance(v, enum.Enum):
+                    v = v.value
+                flat[key] = v
 
     _flatten("", d)
     return flat
 
 
-def manifest_comparable_hash(cfg: MetricCfg) -> str:
-    """Hash of the manifest with the exempt axis (injection) removed.
-    Two runs are comparable iff their hashes match."""
-    flat = experiment_manifest(cfg)
-    for k in _CONFOUND_EXEMPT:
-        flat.pop(k, None)
-    blob = json.dumps(flat, sort_keys=True)
+def experiment_hash(manifest: dict) -> str:
+    """Canonical SHA-256 over a manifest dict. Same config <=> same hash; any
+    changed knob (including depth_cond.injection) changes the hash."""
+    blob = json.dumps(manifest, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()
-
-
-class ConfoundError(RuntimeError):
-    pass
-
-
-def assert_confound_rule(manifest_a: dict, manifest_b: dict) -> None:
-    """Fail loudly unless the two manifests differ in nothing but injection."""
-    keys = set(manifest_a) | set(manifest_b)
-    diffs = []
-    for k in sorted(keys):
-        if k in _CONFOUND_EXEMPT:
-            continue
-        va, vb = manifest_a.get(k, "<missing>"), manifest_b.get(k, "<missing>")
-        if va != vb:
-            diffs.append(f"  {k}: {va!r} vs {vb!r}")
-    if diffs:
-        raise ConfoundError(
-            "CONFOUND RULE VIOLATION: runs being compared differ in more than "
-            "depth_cond.injection. The head-vs-token comparison is not interpretable.\n"
-            + "\n".join(diffs)
-        )

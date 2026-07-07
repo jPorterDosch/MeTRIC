@@ -144,7 +144,8 @@ class DPTHead(nn.Module):
             )
 
         # Otherwise, process frames in chunks to manage memory usage
-        assert frames_chunk_size > 0
+        if frames_chunk_size <= 0:
+            raise ValueError(f"frames_chunk_size must be positive, got {frames_chunk_size}")
 
         # Process frames in batches
         all_preds = []
@@ -227,6 +228,11 @@ class DPTHead(nn.Module):
 
         residuals_flat = None
         if depth_residuals is not None:
+            if len(depth_residuals) != len(self.intermediate_layer_idx):
+                raise ValueError(
+                    f"depth_residuals must have one entry per fusion scale "
+                    f"({len(self.intermediate_layer_idx)}), got {len(depth_residuals)}"
+                )
             residuals_flat = []
             for r in depth_residuals:
                 if frames_start_idx is not None and frames_end_idx is not None:

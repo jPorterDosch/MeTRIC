@@ -247,7 +247,10 @@ class Aggregator(nn.Module):
             S_true = S
 
         if use_cache and S > 1:
-            print(f"Use KV cache expects S=1, got S={S}")
+            raise ValueError(
+                f"KV-cache path expects one frame at a time (S=1), got S={S}; "
+                "cached global attention appends exactly one frame's K/V per call"
+            )
 
         if patch_tokens is None:
             patch_tokens = self.embed_patches(images)
@@ -255,6 +258,11 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         if injected_patch_feats is not None:
+            if injected_patch_feats.shape not in ((B, S, P, C), (B * S, P, C)):
+                raise ValueError(
+                    f"injected_patch_feats shape {tuple(injected_patch_feats.shape)} does not "
+                    f"match patch tokens: expected {(B, S, P, C)} or {(B * S, P, C)}"
+                )
             patch_tokens = patch_tokens + injected_patch_feats.reshape(B * S, P, C)
 
         if use_cache:
@@ -339,8 +347,10 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_size):
             blk = self.frame_blocks[frame_idx]
             if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+                # pos is captured as a default, not passed as a checkpoint input:
+                # it may be None (RoPE disabled) and needs no gradient either way
                 tokens = torch.utils.checkpoint.checkpoint(
-                    lambda t, p, b=blk: b(t, pos=p), tokens, pos, use_reentrant=False
+                    lambda t, b=blk, p=pos: b(t, pos=p), tokens, use_reentrant=False
                 )
             else:
                 tokens = blk(tokens, pos=pos)
@@ -394,9 +404,11 @@ class Aggregator(nn.Module):
             else:
                 blk = self.global_blocks[global_idx]
                 if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+                    # pos/attn_mask captured as defaults (pos may be None with
+                    # RoPE disabled; neither needs gradients)
                     tokens = torch.utils.checkpoint.checkpoint(
-                        lambda t, p, m, b=blk: b(t, pos=p, attn_mask=m),
-                        tokens, pos, attn_mask, use_reentrant=False,
+                        lambda t, b=blk, p=pos, m=attn_mask: b(t, pos=p, attn_mask=m),
+                        tokens, use_reentrant=False,
                     )
                 else:
                     tokens = blk(tokens, pos=pos, attn_mask=attn_mask)

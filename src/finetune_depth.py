@@ -1,18 +1,20 @@
 # --------------------------------------------------------
 # MeTRIC: fine-tune depth-conditioned StreamVGGT (LoRA + DepthConditioner).
 # Head-injection (control) and token-injection (proposed) launch from this
-# same entrypoint with only depth_cond.injection changed; the confound rule
-# is enforced via the experiment manifest.
+# same entrypoint with only --depth-cond.injection changed. Each run is named
+# by a canonical SHA over its config; directory collisions fail fast so a
+# finished experiment is never silently re-run, and the manifest is logged to
+# wandb where runs can be filtered for comparison.
 # Adapted from finetune.py (CUT3R/DUSt3R training code).
 # --------------------------------------------------------
+import dataclasses
 import datetime
 import json
 import math
 import os
-import pathlib
-import random
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sized
 
@@ -26,8 +28,7 @@ import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
-import hydra
-from omegaconf import DictConfig, OmegaConf
+import tyro
 
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
@@ -36,12 +37,15 @@ from datetime import timedelta
 import torch.multiprocessing
 
 from streamvggt.depth_cond import (
+    DepthCondCfg,
+    EncoderCacheCfg,
+    LoRACfg,
     MetricCfg,
     MetricStreamVGGT,
-    assert_confound_rule,
-    build_metric_cfg,
+    TrainCondCfg,
+    experiment_hash,
     experiment_manifest,
-    manifest_comparable_hash,
+    seed_everything,
     simulate_sparse_depth,
 )
 from finetune import save_current_code, setup_for_distributed, build_dataset  # reuse
@@ -54,14 +58,124 @@ printer = get_logger(__name__, log_level="DEBUG")
 WANDB_PROJECT = "MeTRIC"
 WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
 
+_DEFAULT_RESOLUTIONS = (
+    "[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), "
+    "(392, 518), (336, 518), (294, 518), (266, 518)]"
+)
 
-# ---------------------------------------------------------------------------
-# model + manifest
-# ---------------------------------------------------------------------------
+
+@dataclass
+class FinetuneDepthCfg:
+    """Depth-conditioned StreamVGGT fine-tuning. All depth-conditioning /
+    LoRA / cache knobs live in the nested dataclasses (tyro exposes them as
+    e.g. --depth-cond.injection, --lora.rank)."""
+
+    depth_cond: DepthCondCfg = field(default_factory=DepthCondCfg)
+    lora: LoRACfg = field(default_factory=LoRACfg)
+    encoder_cache: EncoderCacheCfg = field(default_factory=EncoderCacheCfg)
+    train: TrainCondCfg = field(default_factory=TrainCondCfg)
+
+    # checkpointing / identity
+    pretrained: str = "../ckpt/checkpoints.pth"
+    resume: str | None = None
+    save_dir: str = "../checkpoints"
+    exp_name: str = "metric_depth_cond"
+
+    # optimization
+    seed: int = 0
+    batch_size: int = 1
+    accum_iter: int = 1
+    epochs: int = 10
+    start_epoch: int = 0
+    start_step: int = 0
+    weight_decay: float = 0.05
+    lr: float = 1e-5
+    min_lr: float = 1e-7
+    warmup_epochs: float = 0.5
+    amp: int = 1
+
+    # data
+    num_views: int = 10
+    num_workers: int = 12
+    fixed_length: bool = True
+    benchmark: bool = False
+    train_dataset: str = (
+        "4500 @ ARKitScenes_Multi(allow_repeat=False, split='train', "
+        "ROOT='../data/train/processed_arkitscenes/', aug_crop=16, "
+        f"resolution={_DEFAULT_RESOLUTIONS}, transform=SeqColorJitter, "
+        "num_views=10, n_corres=0)"
+    )
+    train_criterion: str = (
+        "ConfLoss(Regr3DPose(L21, norm_mode='?avg_dis'), alpha=0.2) + FinetuneLoss()"
+    )
+
+    # logging / saving cadence (not part of the experiment identity)
+    print_freq: int = 10
+    save_freq: float = 0.1
+    keep_freq: int = 1
+
+    # derived at startup (do not set on the CLI)
+    output_dir: str = ""
+
+
+# Trainer fields that define the experiment (hashed alongside the MetricCfg
+# manifest). Deliberately excludes output naming, logging cadence, and worker
+# counts, which do not change the trained model.
+_HASHED_TRAINER_FIELDS = (
+    "pretrained",
+    "seed",
+    "batch_size",
+    "accum_iter",
+    "epochs",
+    "weight_decay",
+    "lr",
+    "min_lr",
+    "warmup_epochs",
+    "amp",
+    "num_views",
+    "fixed_length",
+    "train_dataset",
+    "train_criterion",
+)
+
+
+def build_manifest(cfg: FinetuneDepthCfg, mcfg: MetricCfg) -> dict:
+    manifest = experiment_manifest(mcfg)
+    for f in _HASHED_TRAINER_FIELDS:
+        manifest[f"trainer.{f}"] = getattr(cfg, f)
+    return manifest
+
+
+def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
+    """Derive the save directory from the experiment hash and fail fast on
+    collisions: a completed experiment is never silently re-run; an
+    interrupted one auto-resumes from its last checkpoint."""
+    output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_hash[:10]}")
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    final_ckpt = os.path.join(output_dir, "checkpoint-final.pth")
+    last_ckpt = os.path.join(output_dir, "checkpoint-last.pth")
+    if os.path.isfile(manifest_path):
+        if os.path.isfile(final_ckpt):
+            raise RuntimeError(
+                f"Experiment {run_hash[:10]} already completed in {output_dir} "
+                f"({final_ckpt} exists). Refusing to re-run; change the config "
+                "or remove the directory deliberately."
+            )
+        if os.path.isfile(last_ckpt):
+            printer.info(
+                f"Found interrupted run in {output_dir}; resuming from {last_ckpt}"
+            )
+            cfg.resume = last_ckpt
+        else:
+            raise RuntimeError(
+                f"Output dir {output_dir} exists (same experiment hash) but has no "
+                "checkpoint to resume from. Remove it to re-launch this experiment."
+            )
+    return output_dir
 
 
 def build_model(
-    args: DictConfig,
+    args: FinetuneDepthCfg,
     mcfg: MetricCfg,
     device: torch.device,
     load_pretrained: bool = True,
@@ -86,148 +200,9 @@ def build_model(
     return model, stats
 
 
-def write_manifest_and_check(args: DictConfig, mcfg: MetricCfg) -> dict:
-    manifest = experiment_manifest(mcfg)
-    manifest["_comparable_hash"] = manifest_comparable_hash(mcfg)
-    os.makedirs(args.output_dir, exist_ok=True)
-    path = os.path.join(args.output_dir, "manifest.json")
-    with open(path, "w") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    print(
-        f"Experiment manifest written to {path} (comparable hash {manifest['_comparable_hash'][:12]})"
-    )
-    other = (
-        args.get("compare_with_manifest", None)
-        if hasattr(args, "get")
-        else getattr(args, "compare_with_manifest", None)
-    )
-    if other:
-        with open(other) as f:
-            other_manifest = json.load(f)
-        other_manifest.pop("_comparable_hash", None)
-        assert_confound_rule(other_manifest, experiment_manifest(mcfg))
-        print(
-            f"Confound rule OK against {other}: runs differ only in depth_cond.injection"
-        )
-    return manifest
-
-
-# ---------------------------------------------------------------------------
-# smoke mode: 5-step overfit on one synthetic clip, real criterion, no datasets
-# ---------------------------------------------------------------------------
-
-
-def make_synthetic_clip(
-    num_views: int,
-    B: int = 1,
-    H: int = 154,
-    W: int = 140,
-    device: str | torch.device = "cuda",
-    seed: int = 0,
-) -> list[dict]:
-    """A geometrically consistent synthetic clip: smooth RGB, metric depth,
-    identity poses, pinhole intrinsics, pts3d by unprojection."""
-    g = torch.Generator().manual_seed(seed)
-    f = 0.8 * max(H, W)
-    K = torch.tensor([[f, 0.0, W / 2], [0.0, f, H / 2], [0.0, 0.0, 1.0]])
-    us = torch.arange(W).float().unsqueeze(0).expand(H, W)
-    vs = torch.arange(H).float().unsqueeze(1).expand(H, W)
-    ys = torch.linspace(0, 1, H).unsqueeze(1).expand(H, W)
-    views = []
-    for s in range(num_views):
-        img = torch.zeros(B, 3, H, W)
-        img[:, 0] = ys
-        img[:, 1] = torch.linspace(0, 1, W).unsqueeze(0).expand(H, W)
-        img[:, 2] = 0.5
-        img = (img + 0.1 * torch.rand(B, 3, H, W, generator=g)).clamp(0, 1)
-        depth = 1.5 + 3.0 * ys + 0.2 * torch.rand(B, H, W, generator=g) + 0.05 * s
-        z = depth
-        pts3d = torch.stack(
-            [(us - W / 2) / f * z, (vs - H / 2) / f * z, z], dim=-1
-        )  # [B,H,W,3], camera frame == world frame (identity pose)
-        view = {
-            "img": img * 2 - 1,  # dataset convention [-1,1]; train loop maps to [0,1]
-            "depthmap": depth,
-            "pts3d": pts3d,
-            "valid_mask": torch.ones(B, H, W, dtype=torch.bool),
-            "sky_mask": torch.zeros(B, H, W, dtype=torch.bool),
-            "camera_pose": torch.eye(4).unsqueeze(0).expand(B, 4, 4).contiguous(),
-            "camera_intrinsics": K.unsqueeze(0).expand(B, 3, 3).contiguous(),
-            "camera_only": torch.zeros(B, dtype=torch.bool),
-            "is_metric": torch.ones(B, dtype=torch.bool),
-            "is_metric_scale": torch.ones(B, dtype=torch.bool),
-        }
-        views.append({k: v.to(device) for k, v in view.items()})
-    return views
-
-
-def run_smoke(args: DictConfig, mcfg: MetricCfg) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-
-    model, _ = build_model(args, mcfg, device)
-    model.train()
-
-    criterion = eval(args.train_criterion).to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=float(args.smoke_lr), betas=(0.9, 0.95))
-
-    batch = make_synthetic_clip(
-        int(args.smoke_num_views), device=device, seed=args.seed
-    )
-    for view in batch:
-        view["img"] = (view["img"] + 1.0) / 2.0  # same range mapping as the train loop
-    simulate_sparse_depth(batch, mcfg.depth_cond.sim_num_points)
-
-    losses = []
-    for step in range(int(args.smoke_steps)):
-        result = loss_of_one_batch(
-            batch,
-            model,
-            criterion,
-            accelerator=None,
-            symmetrize_batch=False,
-            use_amp=True,
-        )
-        loss, loss_details = result["loss"]
-        if not math.isfinite(float(loss)):
-            print(f"Loss is {float(loss)}, details: {loss_details}")
-            sys.exit(1)
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        optimizer.step()
-        losses.append(float(loss))
-        print(
-            f"[smoke][{mcfg.depth_cond.injection}] step {step}: loss = {float(loss):.6f}"
-        )
-
-    out = {
-        "injection": mcfg.depth_cond.injection,
-        "losses": losses,
-        "grad_checkpoint": mcfg.train.grad_checkpoint,
-    }
-    with open(os.path.join(args.output_dir, "smoke_result.json"), "w") as f:
-        json.dump(out, f, indent=2)
-    decreased = losses[-1] < losses[0]
-    rises = sum(1 for a, b in zip(losses, losses[1:]) if b > a)
-    print(
-        f"[smoke] loss {losses[0]:.6f} -> {losses[-1]:.6f} (rises: {rises}/{len(losses) - 1})"
-    )
-    if not decreased:
-        print("[smoke] FAIL: loss did not decrease")
-        sys.exit(1)
-    print("[smoke] PASS")
-
-
-# ---------------------------------------------------------------------------
-# full training (accelerate), mirrors finetune.py with depth conditioning
-# ---------------------------------------------------------------------------
-
-
-def train(args: DictConfig, mcfg: MetricCfg) -> None:
+def train(
+    args: FinetuneDepthCfg, mcfg: MetricCfg, manifest: dict, run_hash: str
+) -> None:
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
@@ -241,15 +216,26 @@ def train(args: DictConfig, mcfg: MetricCfg) -> None:
     setup_for_distributed(accelerator)
 
     printer.info("output_dir: " + args.output_dir)
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    wandb_init_kwargs = {"name": args.exp_name, "dir": args.output_dir}
+    # the manifest goes to disk AND to wandb so runs can be filtered for
+    # comparison (e.g. head-vs-token pairs agreeing on every other knob)
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
+            json.dump(
+                {**manifest, "experiment_hash": run_hash}, f, indent=2, sort_keys=True
+            )
+
+    wandb_config = {**dataclasses.asdict(args), **manifest, "experiment_hash": run_hash}
+    wandb_init_kwargs = {
+        "name": f"{args.exp_name}_{run_hash[:10]}",
+        "dir": args.output_dir,
+    }
     if WANDB_ENTITY:
         wandb_init_kwargs["entity"] = WANDB_ENTITY
     accelerator.init_trackers(
         project_name=WANDB_PROJECT,
-        config=OmegaConf.to_container(args, resolve=True),
+        config=wandb_config,
         init_kwargs={"wandb": wandb_init_kwargs},
     )
 
@@ -257,17 +243,11 @@ def train(args: DictConfig, mcfg: MetricCfg) -> None:
         dst_dir = save_current_code(outdir=args.output_dir)
         printer.info(f"Saving current code to {dst_dir}")
 
-    if not args.resume:
-        last_ckpt_fname = os.path.join(args.output_dir, "checkpoint-last.pth")
-        args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
-
     seed = args.seed + accelerator.state.process_index
     printer.info(
         f"Setting seed to {seed} for process {accelerator.state.process_index}"
     )
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
     printer.info("Building train dataset %s", args.train_dataset)
@@ -367,7 +347,7 @@ def train_one_epoch(
     accelerator: Accelerator,
     epoch: int,
     loss_scaler: NativeScaler,
-    args: DictConfig,
+    args: FinetuneDepthCfg,
     mcfg: MetricCfg,
 ) -> dict:
     if not torch.backends.cuda.matmul.allow_tf32:
@@ -379,6 +359,7 @@ def train_one_epoch(
     header = "Epoch: [{}]".format(epoch)
     accum_iter = args.accum_iter
 
+    # duck-typed set_epoch plumbing ported verbatim from finetune.py
     if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
         data_loader.dataset.set_epoch(epoch)
     if (
@@ -400,8 +381,13 @@ def train_one_epoch(
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
 
-            # depth conditioning input: sparse metric samples of the GT depth
-            simulate_sparse_depth(batch, mcfg.depth_cond.sim_num_points)
+            # depth conditioning input: patch-masked samples of the GT depth
+            simulate_sparse_depth(
+                batch,
+                mode=mcfg.depth_cond.sim_mode,
+                patch_size=mcfg.depth_cond.sim_patch_size,
+                mask_ratio=mcfg.depth_cond.sim_mask_ratio,
+            )
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             if data_iter_step % accum_iter == 0:
@@ -466,24 +452,21 @@ def train_one_epoch(
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-@hydra.main(
-    version_base=None,
-    config_path=str(os.path.dirname(os.path.abspath(__file__))) + "/../config",
-    config_name="finetune_depth.yaml",
-)
-def run(cfg: DictConfig) -> None:
-    OmegaConf.resolve(cfg)
-    logdir = pathlib.Path(cfg.logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
+def main(cfg: FinetuneDepthCfg) -> None:
+    mcfg = MetricCfg(
+        depth_cond=cfg.depth_cond,
+        lora=cfg.lora,
+        encoder_cache=cfg.encoder_cache,
+        train=cfg.train,
+    ).validate()
 
-    mcfg = build_metric_cfg(cfg)
-    write_manifest_and_check(cfg, mcfg)
+    manifest = build_manifest(cfg, mcfg)
+    run_hash = experiment_hash(manifest)
+    cfg.output_dir = resolve_output_dir(cfg, run_hash)
+    print(f"Experiment {cfg.exp_name} hash {run_hash[:10]} -> {cfg.output_dir}")
 
-    if cfg.smoke_test:
-        run_smoke(cfg, mcfg)
-    else:
-        train(cfg, mcfg)
+    train(cfg, mcfg, manifest, run_hash)
 
 
 if __name__ == "__main__":
-    run()
+    main(tyro.cli(FinetuneDepthCfg))

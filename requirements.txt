@@ -20,6 +20,7 @@ viser
 gradio
 lpips
 hydra-core
+tyro>=1.0,<2
 h5py
 accelerate
 scikit-learn

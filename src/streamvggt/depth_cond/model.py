@@ -7,8 +7,6 @@ the frozen-encoder feature cache. Nothing here branches on values outside the
 MetricCfg object.
 """
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
@@ -16,7 +14,7 @@ from streamvggt.models.streamvggt import StreamVGGT, StreamVGGTOutput
 
 from .cache import EncoderFeatureCache
 from .conditioner import DepthConditioner, dpt_fusion_sizes
-from .config import MetricCfg
+from .config import InjectionType, MetricCfg
 from .lora import apply_lora, param_stats
 
 
@@ -38,16 +36,33 @@ class MetricStreamVGGT(nn.Module):
 
         self.conditioner = None
         if cfg.depth_cond.enabled:
-            if cfg.depth_cond.injection == "head":
-                # Read the head geometry from the model, not from constants.
-                ref_head = self.model.depth_head
-                out_spec = {
-                    "features": ref_head.scratch.layer1_rn.out_channels,
-                    "num_scales": len(ref_head.intermediate_layer_idx),
-                    "heads": list(cfg.depth_cond.heads),
-                }
-            else:
-                out_spec = {"token_dim": embed_dim}
+            match cfg.depth_cond.injection:
+                case InjectionType.HEAD:
+                    # Fail fast if a configured target head cannot receive
+                    # gradient signal (e.g. the head module is disabled/None):
+                    # silently conditioning a dead head would waste an entire
+                    # training run before anyone noticed.
+                    for head in cfg.depth_cond.heads:
+                        head_module = getattr(self.model, f"{head.value}_head", None)
+                        if head_module is None:
+                            raise ValueError(
+                                f"depth_cond.heads includes {head.value!r} but "
+                                f"model.{head.value}_head is None; this head would "
+                                "never receive gradient signal from the conditioner"
+                            )
+                    # Read the head geometry from the model, not from constants.
+                    ref_head = self.model.depth_head
+                    out_spec = {
+                        "features": ref_head.scratch.layer1_rn.out_channels,
+                        "num_scales": len(ref_head.intermediate_layer_idx),
+                        "heads": list(cfg.depth_cond.heads),
+                    }
+                case InjectionType.TOKEN:
+                    out_spec = {"token_dim": embed_dim}
+                case _:
+                    raise ValueError(
+                        f"unknown injection type: {cfg.depth_cond.injection!r}"
+                    )
             self.conditioner = DepthConditioner(
                 cfg.depth_cond, out_spec, patch_size=patch_size
             )
@@ -63,9 +78,7 @@ class MetricStreamVGGT(nn.Module):
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
-    def load_pretrained(
-        self, path: str, map_location: str | torch.device = "cpu"
-    ) -> torch.nn.modules.module._IncompatibleKeys:
+    def load_pretrained(self, path: str, map_location: str | torch.device = "cpu"):
         """Load the pretrained StreamVGGT checkpoint (raw state_dict) into the
         base model. Must run BEFORE apply_lora_adapters (wrapping renames keys)."""
         if self._lora_applied:
@@ -91,7 +104,9 @@ class MetricStreamVGGT(nn.Module):
     def freeze_for_finetune(self) -> dict:
         """Freeze everything except: LoRA adapters (the base projections stay
         frozen -- wrapping != unfreezing) and the DepthConditioner (which owns
-        all new output-head channels / zero-init convs / gate)."""
+        all new output-head channels / zero-init convs / gate). The pretrained
+        DPT heads themselves stay frozen by design: the conditioner's zero-init
+        convs are the trainable 'new channels' of those heads."""
         for name, p in self.model.named_parameters():
             p.requires_grad = ("lora_A" in name) or ("lora_B" in name)
         if self.conditioner is not None:
@@ -121,36 +136,64 @@ class MetricStreamVGGT(nn.Module):
         B, S, _, H, W = images.shape
         depths, masks = [], []
         for view in views:
-            d = view.get("sparse_depth")
-            m = view.get("sparse_depth_mask")
-            if d is None:
+            if "sparse_depth" in view:
+                d = view["sparse_depth"]
+                m = (
+                    view["sparse_depth_mask"]
+                    if "sparse_depth_mask" in view
+                    else (d > 0).to(d.dtype)
+                )
+            else:
                 d = images.new_zeros(B, H, W)
                 m = images.new_zeros(B, H, W)
-            elif m is None:
-                m = (d > 0).to(d.dtype)
             depths.append(d.to(images.device))
             masks.append(m.to(device=images.device, dtype=images.dtype))
         depth = torch.stack(depths, dim=1)
         mask = torch.stack(masks, dim=1)
         return depth, mask
 
-    def _conditioner_outputs(
+    def _conditioner_output(
         self, views: list[dict], images: torch.Tensor
-    ) -> tuple[Optional[torch.Tensor], Optional[dict]]:
-        """Returns (depth_token_feats, depth_head_residuals) for this batch."""
+    ) -> torch.Tensor | dict | None:
+        """Run the conditioner for this batch. Returns whatever the configured
+        injection produces: token features (TOKEN), per-head residuals dict
+        (HEAD), or None when conditioning is disabled."""
         if self.conditioner is None:
-            return None, None
+            return None
         depth, mask = self._gather_sparse_depth(views, images)
         H, W = images.shape[-2:]
-        if self.cfg.depth_cond.injection == "token":
-            return self.conditioner(depth, mask), None
-        sizes = dpt_fusion_sizes(H, W, self.patch_size)
-        return None, self.conditioner(depth, mask, out_hw_list=sizes)
+        match self.cfg.depth_cond.injection:
+            case InjectionType.TOKEN:
+                return self.conditioner(depth, mask)
+            case InjectionType.HEAD:
+                sizes = dpt_fusion_sizes(H, W, self.patch_size)
+                return self.conditioner(depth, mask, out_hw_list=sizes)
+            case _:
+                raise ValueError(
+                    f"unknown injection type: {self.cfg.depth_cond.injection!r}"
+                )
+
+    def _route_conditioning(self, views: list[dict], images: torch.Tensor) -> dict:
+        """Map the conditioner output to the model kwargs of the configured arm."""
+        out = self._conditioner_output(views, images)
+        if out is None:
+            return {"depth_token_feats": None, "depth_head_residuals": None}
+        match self.cfg.depth_cond.injection:
+            case InjectionType.TOKEN:
+                return {"depth_token_feats": out, "depth_head_residuals": None}
+            case InjectionType.HEAD:
+                return {"depth_token_feats": None, "depth_head_residuals": out}
+            case _:
+                raise ValueError(
+                    f"unknown injection type: {self.cfg.depth_cond.injection!r}"
+                )
 
     # ------------------------------------------------------------------
     # encoder feature cache
     # ------------------------------------------------------------------
-    def _cached_patch_tokens(self, views, images) -> Optional[torch.Tensor]:
+    def _cached_patch_tokens(
+        self, views: list[dict], images: torch.Tensor
+    ) -> torch.Tensor | None:
         """Load (or compute-and-store) frozen patch-embed features.
 
         Frames are keyed by view["cache_key"] (a str for B==1, else a list of B
@@ -164,9 +207,9 @@ class MetricStreamVGGT(nn.Module):
         B, S, _, H, W = images.shape
         keys = []  # [S][B]
         for view in views:
-            k = view.get("cache_key")
-            if k is None:
+            if "cache_key" not in view:
                 return None
+            k = view["cache_key"]
             if isinstance(k, str):
                 k = [k]
             if len(k) != B:
@@ -205,26 +248,22 @@ class MetricStreamVGGT(nn.Module):
     # forward / inference
     # ------------------------------------------------------------------
     def forward(
-        self, views: list[dict], query_points: Optional[torch.Tensor] = None
-    ) -> "StreamVGGTOutput":
+        self, views: list[dict], query_points: torch.Tensor | None = None
+    ) -> StreamVGGTOutput:
         images = torch.stack([view["img"] for view in views], dim=0).permute(
             1, 0, 2, 3, 4
         )
         if images.dim() == 4:
             images = images.unsqueeze(0)
-        token_feats, head_residuals = self._conditioner_outputs(views, images)
+        conditioning = self._route_conditioning(views, images)
         patch_tokens = self._cached_patch_tokens(views, images)
         return self.model(
-            views,
-            query_points,
-            patch_tokens=patch_tokens,
-            depth_token_feats=token_feats,
-            depth_head_residuals=head_residuals,
+            views, query_points, patch_tokens=patch_tokens, **conditioning
         )
 
     def inference(
-        self, frames: list[dict], query_points: Optional[torch.Tensor] = None
-    ) -> "StreamVGGTOutput":
+        self, frames: list[dict], query_points: torch.Tensor | None = None
+    ) -> StreamVGGTOutput:
         """Streaming inference: per-frame conditioning (S=1 is the degenerate
         case of the same [B,S,H,W] contract; token feats enter before the KV
         cache each step)."""
@@ -236,9 +275,9 @@ class MetricStreamVGGT(nn.Module):
                 if img.dim() == 3:
                     img = img.unsqueeze(0)
                 images = img.unsqueeze(1)  # [B,1,3,H,W]
-                token_feats, head_residuals = self._conditioner_outputs([frame], images)
-                token_list.append(token_feats)
-                residual_list.append(head_residuals)
+                conditioning = self._route_conditioning([frame], images)
+                token_list.append(conditioning["depth_token_feats"])
+                residual_list.append(conditioning["depth_head_residuals"])
         return self.model.inference(
             frames,
             query_points,
