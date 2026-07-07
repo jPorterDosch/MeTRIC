@@ -1,9 +1,7 @@
-import os
-from typing import List, Dict, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from .head_act import activate_head
 from .utils import create_uv_grid, position_grid_to_embed
 
@@ -115,6 +113,7 @@ class DPTHead(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         frames_chunk_size: int = 8,
+        depth_residuals: List[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass through the DPT head, supports processing by chunking frames.
@@ -125,6 +124,11 @@ class DPTHead(nn.Module):
                 Used to separate patch tokens from other tokens (e.g., camera or register tokens).
             frames_chunk_size (int, optional): Number of frames to process in each chunk.
                 If None or larger than S, all frames are processed at once. Default: 8.
+            depth_residuals (List[Tensor], optional): depth-conditioning residuals, one
+                per fusion scale, each [B, S, features, h_i, w_i], added to the output of
+                the corresponding scratch.layer{i}_rn conv (numerically equivalent to
+                widening that conv's in_channels with extra zero-init slices).
+                None -> unmodified behavior.
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]:
@@ -135,7 +139,9 @@ class DPTHead(nn.Module):
 
         # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
-            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
+            return self._forward_impl(
+                aggregated_tokens_list, images, patch_start_idx, depth_residuals=depth_residuals
+            )
 
         # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
@@ -150,12 +156,14 @@ class DPTHead(nn.Module):
             # Process batch of frames
             if self.feature_only:
                 chunk_output = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
+                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                    depth_residuals=depth_residuals,
                 )
                 all_preds.append(chunk_output)
             else:
                 chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
+                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx,
+                    depth_residuals=depth_residuals,
                 )
                 all_preds.append(chunk_preds)
                 all_conf.append(chunk_conf)
@@ -173,6 +181,7 @@ class DPTHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        depth_residuals: List[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
@@ -216,8 +225,16 @@ class DPTHead(nn.Module):
             out.append(x)
             dpt_idx += 1
 
+        residuals_flat = None
+        if depth_residuals is not None:
+            residuals_flat = []
+            for r in depth_residuals:
+                if frames_start_idx is not None and frames_end_idx is not None:
+                    r = r[:, frames_start_idx:frames_end_idx]
+                residuals_flat.append(r.reshape(-1, *r.shape[2:]))
+
         # Fuse features from multiple layers.
-        out = self.scratch_forward(out)
+        out = self.scratch_forward(out, depth_residuals=residuals_flat)
         # Interpolate fused output to match target image resolution.
         out = custom_interpolate(
             out,
@@ -251,12 +268,14 @@ class DPTHead(nn.Module):
         pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
         return x + pos_embed
 
-    def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def scratch_forward(self, features: List[torch.Tensor], depth_residuals: List[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass through the fusion blocks.
 
         Args:
             features (List[Tensor]): List of feature maps from different layers.
+            depth_residuals (List[Tensor], optional): per-scale depth-conditioning
+                residuals [N, features, h_i, w_i] added to the layer{i}_rn outputs.
 
         Returns:
             Tensor: Fused feature map.
@@ -267,6 +286,12 @@ class DPTHead(nn.Module):
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        if depth_residuals is not None:
+            layer_1_rn = layer_1_rn + depth_residuals[0]
+            layer_2_rn = layer_2_rn + depth_residuals[1]
+            layer_3_rn = layer_3_rn + depth_residuals[2]
+            layer_4_rn = layer_4_rn + depth_residuals[3]
 
         out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
         del layer_4_rn, layer_4

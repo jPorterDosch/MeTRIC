@@ -7,8 +7,7 @@
 import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Tuple, Union, List
 
 from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
@@ -114,6 +113,11 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
 
+        # Activation memory scales with clip_len x tokens/frame x blocks, not
+        # param count; checkpointing trades ~30% compute to cut it. Set via
+        # depth_cond train.grad_checkpoint (applies to the non-cached path only).
+        self.grad_checkpointing = False
+
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
             raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
@@ -185,17 +189,49 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
+    def embed_patches(self, images: torch.Tensor) -> torch.Tensor:
+        """Run the frozen RGB patch-embed encoder.
+
+        Args:
+            images: [B, S, 3, H, W] in range [0, 1].
+        Returns:
+            patch tokens [B*S, P_patch, C].
+
+        Split out from forward() so the deterministic frozen-encoder output can
+        be precomputed and cached (see streamvggt.depth_cond.cache).
+        """
+        B, S, C_in, H, W = images.shape
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
+        images = images.reshape(B * S, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        return patch_tokens
+
     def forward(
         self,
         images: torch.Tensor,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        patch_tokens=None,
+        injected_patch_feats=None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            patch_tokens: optional precomputed output of embed_patches(images)
+                (frozen-encoder feature cache path). Must be numerically the
+                tensor embed_patches would produce for these images.
+            injected_patch_feats: optional depth-conditioning features added
+                residually to the RGB patch tokens BEFORE any attention block
+                (i.e. before the causal K/V cache). [B, S, P_patch, C] or
+                [B*S, P_patch, C]. None -> unmodified behavior.
 
         Returns:
             (list[torch.Tensor], int):
@@ -209,24 +245,17 @@ class Aggregator(nn.Module):
             S_true += 1
         else:
             S_true = S
-        
+
         if use_cache and S > 1:
             print(f"Use KV cache expects S=1, got S={S}")
 
-        if C_in != 3:
-            raise ValueError(f"Expected 3 input channels, got {C_in}")
-
-        # Normalize images and reshape for patch embed
-        images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
-
-        # Reshape to [B*S, C, H, W] for patch embedding
-        images = images.reshape(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
-
-        if isinstance(patch_tokens, dict):
-            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        if patch_tokens is None:
+            patch_tokens = self.embed_patches(images)
 
         _, P, C = patch_tokens.shape
+
+        if injected_patch_feats is not None:
+            patch_tokens = patch_tokens + injected_patch_feats.reshape(B * S, P, C)
 
         if use_cache:
             camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
@@ -308,7 +337,13 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+            blk = self.frame_blocks[frame_idx]
+            if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+                tokens = torch.utils.checkpoint.checkpoint(
+                    lambda t, p, b=blk: b(t, pos=p), tokens, pos, use_reentrant=False
+                )
+            else:
+                tokens = blk(tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.reshape(B, S, P, C))
 
@@ -357,7 +392,14 @@ class Aggregator(nn.Module):
                     use_cache=True
                 )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
+                blk = self.global_blocks[global_idx]
+                if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+                    tokens = torch.utils.checkpoint.checkpoint(
+                        lambda t, p, m, b=blk: b(t, pos=p, attn_mask=m),
+                        tokens, pos, attn_mask, use_reentrant=False,
+                    )
+                else:
+                    tokens = blk(tokens, pos=pos, attn_mask=attn_mask)
             global_idx += 1
             intermediates.append(tokens.reshape(B, S, P, C))
 
