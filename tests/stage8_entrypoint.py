@@ -44,7 +44,9 @@ def driver() -> None:
 
     # swap the dust3r dataset construction for the synthetic loader; everything
     # downstream (accelerate.prepare, the epoch loop, saving, resume) is real.
-    def fake_build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
+    def fake_build_dataset(
+        dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False
+    ):
         # 224x224 (16x16 patch grid): large enough that the track head's
         # correlation pyramid does not pool down to 0x0 (it runs because
         # loss_of_one_batch samples query points from valid_mask).
@@ -108,15 +110,21 @@ def run_checks() -> None:
 
         # --- Run A: fresh end-to-end run (1 epoch) ---
         rA = _run({**base_env, "SC_EPOCHS": "1"})
-        assert rA.returncode == 0, f"run A failed:\n{rA.stdout[-4000:]}\n{rA.stderr[-4000:]}"
-        assert "saving at step" in rA.stdout, "mid-epoch checkpoint-last save never fired"
+        assert rA.returncode == 0, (
+            f"run A failed:\n{rA.stdout[-4000:]}\n{rA.stderr[-4000:]}"
+        )
+        assert "saving at step" in rA.stdout, (
+            "mid-epoch checkpoint-last save never fired"
+        )
 
         dirs = [d for d in os.listdir(save_dir) if d.startswith("stage8_")]
         assert len(dirs) == 1, f"expected one output dir, got {dirs}"
         out = os.path.join(save_dir, dirs[0])
         for fname in ("manifest.json", "checkpoint-last.pth", "checkpoint-final.pth"):
             assert os.path.isfile(os.path.join(out, fname)), f"missing {fname} in {out}"
-        print("[stage8] run A: e2e train() completed; manifest + mid-epoch + final checkpoints written")
+        print(
+            "[stage8] run A: e2e train() completed; manifest + mid-epoch + final checkpoints written"
+        )
 
         # --- artifact is loadable from a process WITHOUT streamvggt on the path
         # (the checkpoint-pickle fix: args must reduce to builtins only) ---
@@ -130,19 +138,47 @@ def run_checks() -> None:
             "print('probe OK')\n"
         )
         rP = subprocess.run(
-            [sys.executable, "-c", probe], cwd="/tmp", capture_output=True, text=True, timeout=300
+            [sys.executable, "-c", probe],
+            cwd="/tmp",
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
         assert rP.returncode == 0 and "probe OK" in rP.stdout, (
             f"checkpoint not self-contained:\n{rP.stdout[-2000:]}\n{rP.stderr[-2000:]}"
         )
-        print("[stage8] run A: checkpoint unpickles with builtins only, no streamvggt import (pickle fix holds)")
+        print(
+            "[stage8] run A: checkpoint unpickles with builtins only, no streamvggt import (pickle fix holds)"
+        )
 
         # --- Run B: resume from checkpoint-last, train one more epoch ---
-        rB = _run({**base_env, "SC_EPOCHS": "2", "SC_RESUME": os.path.join(out, "checkpoint-last.pth")})
-        assert rB.returncode == 0, f"run B (resume) failed:\n{rB.stdout[-4000:]}\n{rB.stderr[-4000:]}"
+        # resume derives the output dir from the checkpoint's parent, so Run B
+        # continues INTO Run A's dir even though --epochs (an identity knob)
+        # changed; capture the final-checkpoint mtime so the assertion actually
+        # verifies Run B re-wrote it rather than matching Run A's leftover file.
+        final_ckpt = os.path.join(out, "checkpoint-final.pth")
+        mtime_a = os.path.getmtime(final_ckpt)
+        rB = _run(
+            {
+                **base_env,
+                "SC_EPOCHS": "2",
+                "SC_RESUME": os.path.join(out, "checkpoint-last.pth"),
+            }
+        )
+        assert rB.returncode == 0, (
+            f"run B (resume) failed:\n{rB.stdout[-4000:]}\n{rB.stderr[-4000:]}"
+        )
         assert "DRIVER_RESUMED" in rB.stdout, "resume path did not advance start_epoch"
-        assert os.path.isfile(os.path.join(out, "checkpoint-final.pth"))
-        print("[stage8] run B: --resume loaded the checkpoint and completed another epoch")
+        new_dirs = [d for d in os.listdir(save_dir) if d.startswith("stage8_")]
+        assert new_dirs == dirs, (
+            f"resume forked a new output dir: {set(new_dirs) - set(dirs)}"
+        )
+        assert os.path.getmtime(final_ckpt) > mtime_a, (
+            "resume did not re-write checkpoint-final in the run's dir"
+        )
+        print(
+            "[stage8] run B: --resume continued INTO the same dir and re-wrote checkpoint-final"
+        )
 
     print("STAGE 8 PASS")
 

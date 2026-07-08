@@ -96,7 +96,13 @@ class _SyntheticClips(Dataset):
     train loop's (img + 1) / 2 rescale recovers [0, 1] before the model."""
 
     def __init__(self, num_views: int, n_steps: int, H: int, W: int, seed: int) -> None:
-        self.num_views, self.n_steps, self.H, self.W, self.seed = num_views, n_steps, H, W, seed
+        self.num_views, self.n_steps, self.H, self.W, self.seed = (
+            num_views,
+            n_steps,
+            H,
+            W,
+            seed,
+        )
 
     def __len__(self) -> int:
         return self.n_steps

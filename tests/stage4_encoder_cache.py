@@ -58,6 +58,20 @@ def main():
         print(f"[stage4] live vs cache-warm: max|diff| = {d2:.3e} ({k2})")
         assert d2 <= TOL, f"FAIL: {d2} > {TOL}"
 
+        # positive hit check: the warm-path equivalence above is only meaningful
+        # if the warm pass actually READS the stored features. Poison one cached
+        # file and confirm the output changes -- proving a real cache hit rather
+        # than a silent recompute-and-restore (which would also pass d2 <= TOL).
+        key = views[0]["cache_key"]
+        stored = model.cache.load(key)
+        model.cache.save(key, stored + 1.0)
+        poisoned = collect_outputs(model, views)
+        d3, _ = max_abs_diff(ref, poisoned)
+        print(f"[stage4] poisoned-cache hit check: max|diff| = {d3:.3e} (expect > 0)")
+        assert d3 > TOL, (
+            "warm pass ignored the stored file -> cache is not actually hit"
+        )
+
     print("STAGE 4 PASS")
 
 

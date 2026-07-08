@@ -49,7 +49,7 @@ from streamvggt.depth_cond import (
     simulate_sparse_depth,
 )
 from finetune import save_current_code, setup_for_distributed, build_dataset  # reuse
-from utils import picklable_args, resolve_output_dir, to_primitive
+from train_utils import picklable_args, resolve_output_dir, to_primitive
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 torch.multiprocessing.set_sharing_strategy("file_system")

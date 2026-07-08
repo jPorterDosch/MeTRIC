@@ -1,7 +1,10 @@
 """Shared helpers for the training entrypoints (see finetune_depth.py).
 
 Kept in an importable module (not the __main__ script) so that a checkpoint's
-saved config snapshot never depends on the module that produced it.
+saved config snapshot never depends on the module that produced it. Named
+`train_utils` rather than `utils` deliberately: a top-level `utils` module
+shadows the vendored `src/croco/utils` namespace package once `src/` is on the
+path, breaking croco's own `import utils.misc`.
 """
 
 from __future__ import annotations
@@ -15,11 +18,22 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from finetune_depth import FinetuneDepthCfg
 
+# Rank env vars exported by the launchers we support, in priority order.
+# accelerate/torchrun set RANK/LOCAL_RANK; SLURM srun sets SLURM_PROCID; MPI
+# launchers set OMPI_COMM_WORLD_RANK / PMI_RANK. The first one present wins.
+_RANK_ENV_VARS = ("RANK", "LOCAL_RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK")
+
 
 def is_rank_zero() -> bool:
-    """True on the main process, including before Accelerator/dist init exists
-    (torchrun/accelerate launch export RANK / LOCAL_RANK to every process)."""
-    return os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) == "0"
+    """True on the main process, including before Accelerator/dist init exists.
+    Checks several launcher conventions so a multi-GPU srun/MPI job (which does
+    not export RANK the way torchrun does) still identifies its non-zero ranks
+    -- otherwise every rank would run the resolve_output_dir existence check and
+    the later ranks would abort on the directory rank 0 just created."""
+    for var in _RANK_ENV_VARS:
+        if var in os.environ:
+            return os.environ[var] == "0"
+    return True
 
 
 def to_primitive(obj):
@@ -49,16 +63,24 @@ def picklable_args(cfg: FinetuneDepthCfg) -> argparse.Namespace:
 
 
 def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
-    """Derive the save directory (<save_dir>/<exp_name>_<hash>) and fail fast
-    if it already exists: an experiment with this exact config has been run or
-    is running, and silently re-running it would waste the compute. To resume
-    an interrupted run, pass --resume <path/to/checkpoint-last.pth> explicitly.
+    """Derive the save directory for this run.
 
-    Only rank 0 performs the existence check: under multi-process launch the
-    non-zero ranks start later and would otherwise see the directory rank 0
-    just created and abort the whole job."""
+    Resume: continue the run that OWNS the checkpoint -- the output dir is the
+    checkpoint's parent -- regardless of any identity-knob drift in the current
+    config (e.g. a bumped --epochs to extend the run). Deriving it from the
+    current hash instead would silently fork the resumed run into a fresh
+    directory, splitting one logical run across two dirs / wandb runs.
+
+    Fresh run: <save_dir>/<exp_name>_<hash>, failing fast if it already exists
+    (an experiment with this exact config has been run or is running, and
+    silently re-running it would waste the compute). Only rank 0 performs the
+    existence check: under multi-process launch the non-zero ranks start later
+    and would otherwise see the directory rank 0 just created and abort the job.
+    """
+    if cfg.resume:
+        return os.path.dirname(os.path.abspath(cfg.resume))
     output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_hash[:10]}")
-    if cfg.resume or not is_rank_zero():
+    if not is_rank_zero():
         return output_dir
     if os.path.exists(output_dir):
         raise RuntimeError(

@@ -59,7 +59,9 @@ def zero_depth(views):
 def collect_outputs(model, views, query_points=None):
     """Forward and pull the comparable prediction tensors out of the output."""
     out = model(views, query_points)
-    assert out.ress, "model returned no per-frame outputs; equivalence check would be vacuous"
+    assert out.ress, (
+        "model returned no per-frame outputs; equivalence check would be vacuous"
+    )
     res = {}
     for s, r in enumerate(out.ress):
         res[f"depth_{s}"] = r["depth"].float().cpu()
@@ -99,9 +101,18 @@ def load_ckpt_cpu():
 
 
 def free(model):
-    del model
+    """Release a model's GPU memory. `del model` here only unbinds this local
+    parameter -- the caller still holds its own reference, so the object cannot
+    be collected. Moving it to CPU frees the GPU allocation regardless, which is
+    what the stage tests actually need to avoid holding two full models on the
+    device at once."""
     import gc
 
+    try:
+        model.to("cpu")
+    except Exception:
+        pass
+    del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
