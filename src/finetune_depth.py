@@ -7,8 +7,6 @@
 # wandb where runs can be filtered for comparison.
 # Adapted from finetune.py (CUT3R/DUSt3R training code).
 # --------------------------------------------------------
-import argparse
-import dataclasses
 import datetime
 import json
 import math
@@ -51,6 +49,7 @@ from streamvggt.depth_cond import (
     simulate_sparse_depth,
 )
 from finetune import save_current_code, setup_for_distributed, build_dataset  # reuse
+from utils import picklable_args, resolve_output_dir, to_primitive
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -142,43 +141,6 @@ def build_manifest(cfg: FinetuneDepthCfg) -> dict:
     return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
 
 
-def _is_rank_zero() -> bool:
-    """True on the main process, including before Accelerator/dist init exists
-    (torchrun/accelerate launch export RANK / LOCAL_RANK to every process)."""
-    return os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) == "0"
-
-
-def _picklable_args(cfg: FinetuneDepthCfg) -> argparse.Namespace:
-    """Config snapshot safe to embed in checkpoints. FinetuneDepthCfg lives in
-    __main__, so pickling the dataclass itself would make every checkpoint
-    unloadable from any other script (eval scripts torch.load the whole file);
-    a Namespace of plain dicts is importable everywhere and still offers the
-    attribute access croco's misc.save_model needs (args.output_dir)."""
-    return argparse.Namespace(**dataclasses.asdict(cfg))
-
-
-def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
-    """Derive the save directory (<save_dir>/<exp_name>_<hash>) and fail fast
-    if it already exists: an experiment with this exact config has been run or
-    is running, and silently re-running it would waste the compute. To resume
-    an interrupted run, pass --resume <path/to/checkpoint-last.pth> explicitly.
-
-    Only rank 0 performs the existence check: under multi-process launch the
-    non-zero ranks start later and would otherwise see the directory rank 0
-    just created and abort the whole job."""
-    output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_hash[:10]}")
-    if cfg.resume or not _is_rank_zero():
-        return output_dir
-    if os.path.exists(output_dir):
-        raise RuntimeError(
-            f"Output dir {output_dir} already exists: an experiment with this exact "
-            "config hash has already been launched. Refusing to re-run. Either change "
-            f"the config, pass --resume {os.path.join(output_dir, 'checkpoint-last.pth')} "
-            "to continue an interrupted run, or remove the directory deliberately."
-        )
-    return output_dir
-
-
 def build_model(
     args: FinetuneDepthCfg,
     mcfg: MetricCfg,
@@ -231,7 +193,7 @@ def train(
                 {**manifest, "experiment_hash": run_hash}, f, indent=2, sort_keys=True
             )
 
-    wandb_config = {**dataclasses.asdict(args), **manifest, "experiment_hash": run_hash}
+    wandb_config = {**to_primitive(args), **manifest, "experiment_hash": run_hash}
     wandb_init_kwargs = {
         "name": f"{args.exp_name}_{run_hash[:10]}",
         "dir": args.output_dir,
@@ -291,7 +253,7 @@ def train(
     ) -> None:
         misc.save_model(
             accelerator=accelerator,
-            args=_picklable_args(args),
+            args=picklable_args(args),
             model_without_ddp=accelerator.unwrap_model(model),
             optimizer=optimizer,
             loss_scaler=loss_scaler,
@@ -337,7 +299,7 @@ def train(
 
     output_dir = Path(args.output_dir)
     to_save = {
-        "args": _picklable_args(args),
+        "args": picklable_args(args),
         "model": accelerator.unwrap_model(model).cpu().state_dict(),
         "epoch": args.epochs,
     }
