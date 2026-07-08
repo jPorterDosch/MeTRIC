@@ -207,8 +207,26 @@ def experiment_manifest(cfg, exclude: tuple[str, ...] = ()) -> dict:
     return flat
 
 
+# Length of the short, human-facing experiment id (hex chars of the full
+# hash). 16 hex = 64 bits: collision-free at any realistic experiment count,
+# still short enough for a directory name. This is the SINGLE source of truth
+# for the truncation -- every consumer (dir name, wandb run name, logs) uses
+# experiment_id() rather than slicing the hash itself, so the length can never
+# desync between call sites.
+SHORT_HASH_LEN = 16
+
+
 def experiment_hash(manifest: dict) -> str:
-    """Canonical SHA-256 over a manifest dict. Same config <=> same hash; any
-    changed knob (including depth_cond.injection) changes the hash."""
+    """Canonical full SHA-256 over a manifest dict. Same config <=> same hash;
+    any changed knob changes the hash. This is
+    the authoritative identity (used for equality checks); for naming/display
+    use experiment_id()."""
     blob = json.dumps(manifest, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def experiment_id(manifest: dict) -> str:
+    """Short, human-facing experiment id: the first SHORT_HASH_LEN hex chars of
+    experiment_hash. The one place display-length truncation is defined, so dir
+    names, wandb run names, and logs stay in lockstep."""
+    return experiment_hash(manifest)[:SHORT_HASH_LEN]

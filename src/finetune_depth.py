@@ -44,6 +44,7 @@ from streamvggt.depth_cond import (
     MetricStreamVGGT,
     TrainCondCfg,
     experiment_hash,
+    experiment_id,
     experiment_manifest,
     seed_everything,
     simulate_sparse_depth,
@@ -168,7 +169,7 @@ def build_model(
 
 
 def train(
-    args: FinetuneDepthCfg, mcfg: MetricCfg, manifest: dict, run_hash: str
+    args: FinetuneDepthCfg, mcfg: MetricCfg, manifest: dict, run_hash: str, run_id: str
 ) -> None:
     accelerator = Accelerator(
         gradient_accumulation_steps=args.accum_iter,
@@ -187,15 +188,14 @@ def train(
 
     # the manifest goes to disk AND to wandb so runs can be filtered for
     # comparison (e.g. head-vs-token pairs agreeing on every other knob)
+    record = {"experiment_hash": run_hash, "experiment_id": run_id}
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
-            json.dump(
-                {**manifest, "experiment_hash": run_hash}, f, indent=2, sort_keys=True
-            )
+            json.dump({**manifest, **record}, f, indent=2, sort_keys=True)
 
-    wandb_config = {**to_primitive(args), **manifest, "experiment_hash": run_hash}
+    wandb_config = {**to_primitive(args), **manifest, **record}
     wandb_init_kwargs = {
-        "name": f"{args.exp_name}_{run_hash[:10]}",
+        "name": f"{args.exp_name}_{run_id}",
         "dir": args.output_dir,
     }
     if WANDB_ENTITY:
@@ -445,11 +445,12 @@ def main(cfg: FinetuneDepthCfg) -> None:
     ).validate()
 
     manifest = build_manifest(cfg)
-    run_hash = experiment_hash(manifest)
-    cfg.output_dir = resolve_output_dir(cfg, run_hash)
-    print(f"Experiment {cfg.exp_name} hash {run_hash[:10]} -> {cfg.output_dir}")
+    run_hash = experiment_hash(manifest)  # full, canonical identity (record + wandb)
+    run_id = experiment_id(manifest)  # short display id, single source of truth
+    cfg.output_dir = resolve_output_dir(cfg, run_id)
+    print(f"Experiment {cfg.exp_name} id {run_id} -> {cfg.output_dir}")
 
-    train(cfg, mcfg, manifest, run_hash)
+    train(cfg, mcfg, manifest, run_hash, run_id)
 
 
 if __name__ == "__main__":

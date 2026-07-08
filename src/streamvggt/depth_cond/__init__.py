@@ -11,7 +11,9 @@ from .config import (
     SparseSimMode,
     TemporalType,
     TrainCondCfg,
+    SHORT_HASH_LEN,
     experiment_hash,
+    experiment_id,
     experiment_manifest,
 )
 from .conditioner import DepthConditioner, dpt_fusion_sizes, masked_downsample
@@ -36,6 +38,8 @@ __all__ = [
     "SparseSimMode",
     "experiment_manifest",
     "experiment_hash",
+    "experiment_id",
+    "SHORT_HASH_LEN",
     "DepthConditioner",
     "masked_downsample",
     "dpt_fusion_sizes",

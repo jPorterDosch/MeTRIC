@@ -21,7 +21,13 @@ if TYPE_CHECKING:
 # Rank env vars exported by the launchers we support, in priority order.
 # accelerate/torchrun set RANK/LOCAL_RANK; SLURM srun sets SLURM_PROCID; MPI
 # launchers set OMPI_COMM_WORLD_RANK / PMI_RANK. The first one present wins.
-_RANK_ENV_VARS = ("RANK", "LOCAL_RANK", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK")
+_RANK_ENV_VARS = (
+    "RANK",
+    "LOCAL_RANK",
+    "SLURM_PROCID",
+    "OMPI_COMM_WORLD_RANK",
+    "PMI_RANK",
+)
 
 
 def is_rank_zero() -> bool:
@@ -43,7 +49,9 @@ def to_primitive(obj):
     if isinstance(obj, enum.Enum):
         return obj.value
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: to_primitive(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+        return {
+            f.name: to_primitive(getattr(obj, f.name)) for f in dataclasses.fields(obj)
+        }
     if isinstance(obj, dict):
         return {k: to_primitive(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -62,16 +70,18 @@ def picklable_args(cfg: FinetuneDepthCfg) -> argparse.Namespace:
     return argparse.Namespace(**to_primitive(cfg))
 
 
-def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
-    """Derive the save directory for this run.
+def resolve_output_dir(cfg: FinetuneDepthCfg, run_id: str) -> str:
+    """Derive the save directory for this run. `run_id` is the already-truncated
+    short experiment id (see config.experiment_id) -- it is used verbatim, never
+    re-sliced here, so the truncation length lives in exactly one place.
 
     Resume: continue the run that OWNS the checkpoint -- the output dir is the
     checkpoint's parent -- regardless of any identity-knob drift in the current
     config (e.g. a bumped --epochs to extend the run). Deriving it from the
-    current hash instead would silently fork the resumed run into a fresh
+    current id instead would silently fork the resumed run into a fresh
     directory, splitting one logical run across two dirs / wandb runs.
 
-    Fresh run: <save_dir>/<exp_name>_<hash>, failing fast if it already exists
+    Fresh run: <save_dir>/<exp_name>_<run_id>, failing fast if it already exists
     (an experiment with this exact config has been run or is running, and
     silently re-running it would waste the compute). Only rank 0 performs the
     existence check: under multi-process launch the non-zero ranks start later
@@ -79,7 +89,7 @@ def resolve_output_dir(cfg: FinetuneDepthCfg, run_hash: str) -> str:
     """
     if cfg.resume:
         return os.path.dirname(os.path.abspath(cfg.resume))
-    output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_hash[:10]}")
+    output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_id}")
     if not is_rank_zero():
         return output_dir
     if os.path.exists(output_dir):

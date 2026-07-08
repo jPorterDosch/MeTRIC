@@ -26,6 +26,7 @@ from streamvggt.depth_cond import (
     InjectionType,
     MetricCfg,
     experiment_hash,
+    experiment_id,
     simulate_sparse_depth,
 )
 from finetune_depth import (
@@ -93,22 +94,24 @@ def check_hash_and_collision() -> None:
     )
     print("[stage7] experiment hashes: stable, and arms separate")
 
-    # collision fail-fast: ANY pre-existing output dir must refuse to relaunch
+    # collision fail-fast: ANY pre-existing output dir must refuse to relaunch.
+    # The dir name is built from experiment_id (the single source of truth for
+    # the short-id length) -- no hardcoded slice that could desync from prod.
     with tempfile.TemporaryDirectory(prefix="stage7_dirs_") as tmp:
         cfg = make_cfg(InjectionType.HEAD)
         cfg.save_dir = tmp
-        h = experiment_hash(build_manifest(cfg))
-        out = os.path.join(tmp, f"{cfg.exp_name}_{h[:10]}")
+        rid = experiment_id(build_manifest(cfg))
+        out = os.path.join(tmp, f"{cfg.exp_name}_{rid}")
         os.makedirs(out)  # merely created, no checkpoints inside
         try:
-            resolve_output_dir(cfg, h)
+            resolve_output_dir(cfg, rid)
         except RuntimeError as e:
             print(f"[stage7] collision fail-fast fired: {str(e)[:70]}...")
         else:
             raise AssertionError("resolve_output_dir did not fail on an existing dir")
         # explicit --resume bypasses the collision check
         cfg.resume = os.path.join(out, "checkpoint-last.pth")
-        assert resolve_output_dir(cfg, h) == out
+        assert resolve_output_dir(cfg, rid) == out
 
 
 def main() -> None:
