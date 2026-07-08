@@ -7,7 +7,7 @@ from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from streamvggt.heads.track_head import TrackHead
 from transformers.file_utils import ModelOutput
-from typing import Optional, Tuple, List, Any
+from typing import Optional, List
 from dataclasses import dataclass
 
 @dataclass
@@ -34,8 +34,20 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         history_info: Optional[dict] = None,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        patch_tokens=None,
+        depth_token_feats=None,
+        depth_head_residuals=None,
     ):
+        """Optional depth-conditioning inputs (all default None -> pretrained behavior):
+            patch_tokens: precomputed aggregator.embed_patches output (encoder cache).
+            depth_token_feats: [B,S,P_patch,C] added residually to the RGB patch
+                tokens before the attention blocks (token injection, pre-KV-cache).
+            depth_head_residuals: dict with an entry for EVERY head name
+                ("depth", "point"): per-scale residual list, or None for a head
+                that receives no conditioning. Missing keys are a plumbing bug
+                and raise KeyError (head injection, post-cache).
+        """
         images = torch.stack(
             [view["img"] for view in views], dim=0
         ).permute(1, 0, 2, 3, 4)    # B S C H W
@@ -49,7 +61,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        if depth_head_residuals is None:
+            depth_head_residuals = {"depth": None, "point": None}
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images, patch_tokens=patch_tokens, injected_patch_feats=depth_token_feats
+        )
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -59,14 +75,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx,
+                    depth_residuals=depth_head_residuals["depth"],
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
             if self.point_head is not None:
                 pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx,
+                    depth_residuals=depth_head_residuals["point"],
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
@@ -102,27 +120,52 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 ress.append(res)
             return StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
         
-    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):        
+    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None,
+                  depth_token_feats_list=None, depth_head_residuals_list=None):
+        """Streaming inference with the causal KV cache.
+
+        depth_token_feats_list / depth_head_residuals_list: optional per-frame
+        depth-conditioning inputs (same semantics as in forward(), one entry per
+        frame, entries may be None). Token feats enter BEFORE the KV cache.
+        """
+        if depth_token_feats_list is not None and len(depth_token_feats_list) != len(frames):
+            raise ValueError(
+                f"depth_token_feats_list has {len(depth_token_feats_list)} entries "
+                f"for {len(frames)} frames; must match (use None entries for "
+                "unconditioned frames)"
+            )
+        if depth_head_residuals_list is not None and len(depth_head_residuals_list) != len(frames):
+            raise ValueError(
+                f"depth_head_residuals_list has {len(depth_head_residuals_list)} entries "
+                f"for {len(frames)} frames; must match (use None entries for "
+                "unconditioned frames)"
+            )
+
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
-        
+
         all_ress = []
         processed_frames = []
 
         for i, frame in enumerate(frames):
-            images = frame["img"].unsqueeze(0) 
+            images = frame["img"].unsqueeze(0)
+            token_feats = depth_token_feats_list[i] if depth_token_feats_list is not None else None
+            head_residuals = depth_head_residuals_list[i] if depth_head_residuals_list is not None else None
+            if head_residuals is None:
+                head_residuals = {"depth": None, "point": None}
             aggregator_output = self.aggregator(
-                images, 
+                images,
                 past_key_values=past_key_values,
-                use_cache=True, 
-                past_frame_idx=i
+                use_cache=True,
+                past_frame_idx=i,
+                injected_patch_feats=token_feats,
             )
-            
+
             if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
                 aggregated_tokens, patch_start_idx, past_key_values = aggregator_output
             else:
                 aggregated_tokens, patch_start_idx = aggregator_output
-            
+
             with torch.cuda.amp.autocast(enabled=False):
                 if self.camera_head is not None:
                     pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
@@ -131,16 +174,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if self.depth_head is not None:
                     depth, depth_conf = self.depth_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx,
+                        depth_residuals=head_residuals["depth"],
                     )
-                    depth = depth[:, 0] 
+                    depth = depth[:, 0]
                     depth_conf = depth_conf[:, 0]
-                
+
                 if self.point_head is not None:
                     pts3d, pts3d_conf = self.point_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx,
+                        depth_residuals=head_residuals["point"],
                     )
-                    pts3d = pts3d[:, 0] 
+                    pts3d = pts3d[:, 0]
                     pts3d_conf = pts3d_conf[:, 0]
 
                 if self.track_head is not None and query_points is not None:
