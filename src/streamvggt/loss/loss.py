@@ -88,9 +88,8 @@ MSE = MSELoss()
 class Criterion(nn.Module):
     def __init__(self, criterion: BaseCriterion | None = None) -> None:
         super().__init__()
-        assert isinstance(criterion, BaseCriterion), (
-            f"{criterion} is not a proper criterion!"
-        )
+        if not isinstance(criterion, BaseCriterion):
+            raise ValueError(f"{criterion} is not a proper criterion!")
         self.criterion = copy(criterion)
 
     def get_name(self) -> str:
