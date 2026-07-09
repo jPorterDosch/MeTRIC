@@ -10,8 +10,12 @@ num_test_views : 4
 n_corres_train: 0
 n_corres_test: 0
 
-train_criterion: DistillLoss()
-test_criterion: DistillLoss()
+# Training objective. See streamvggt.loss.types.LossConfig for all knobs.
+# recipe=distill -> DistillLoss()
+loss:
+  recipe: distill
+test_loss:
+  recipe: distill
 allow_repeat: False
 
 dataset1: Co3d_Multi(allow_repeat=${allow_repeat}, split='train', ROOT='../data/train/processed_co3d/', 

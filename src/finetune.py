@@ -21,7 +21,7 @@ import torch.backends.cudnn as cudnn
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
 from dust3r.datasets import get_data_loader
-from streamvggt.loss.loss import *  # noqa: F401, needed when loading the model
+from train_utils import loss_from_cfg
 from dust3r.inference import loss_of_one_batch  # noqa
 from dust3r.viz import colorize
 import dust3r.utils.path_to_croco  # noqa: F401
@@ -181,12 +181,11 @@ def train(args):
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
-    )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
+    train_criterion = loss_from_cfg(args.loss).build().to(device)
+    printer.info(f">> Creating train criterion = {train_criterion!r}")
+    test_loss = args.test_loss if args.get("test_loss") else args.loss
+    test_criterion = loss_from_cfg(test_loss).build().to(device)
+    printer.info(f">> Creating test criterion = {test_criterion!r}")
 
     model.to(device)
 

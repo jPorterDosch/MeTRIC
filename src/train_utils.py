@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from finetune_depth import FinetuneDepthCfg
+    from streamvggt.loss import LossConfig
 
 # Rank env vars exported by the launchers we support, in priority order.
 # accelerate/torchrun set RANK/LOCAL_RANK; SLURM srun sets SLURM_PROCID; MPI
@@ -40,6 +41,26 @@ def is_rank_zero() -> bool:
         if var in os.environ:
             return os.environ[var] == "0"
     return True
+
+
+def loss_from_cfg(node) -> "LossConfig":
+    """Build a LossConfig from a hydra/OmegaConf node.
+
+    The hydra entrypoints load config as an OmegaConf DictConfig of plain
+    scalars (string-valued enums); this converts it to a plain dict and hands it
+    to LossConfig, whose __post_init__ coerces the strings back to enums. The
+    tyro entrypoint (finetune_depth) skips all this -- tyro already produces a
+    typed LossConfig, so it just calls ``args.loss.build()`` directly.
+
+    Keeping this OmegaConf glue here rather than in the loss package leaves
+    streamvggt.loss.types framework-agnostic. Imports are local so importing
+    train_utils (e.g. for the checkpoint-config path) stays cheap and does not
+    pull in torch or OmegaConf.
+    """
+    from omegaconf import OmegaConf
+    from streamvggt.loss import LossConfig
+
+    return LossConfig(**OmegaConf.to_container(node, resolve=True))
 
 
 def to_primitive(obj):
