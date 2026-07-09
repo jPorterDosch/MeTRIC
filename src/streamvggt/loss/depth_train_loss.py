@@ -51,8 +51,11 @@ class DepthTrainLoss(MultiLoss):
         losses = []
 
         # ---------- Ltemporal (temporal depth-gradient consistency) ----------
+        # GT dense depth lives in "depthmap" [B,H,W]; the model's prediction is
+        # "depth" [B,H,W,1] ("depth" on a GT view would be a teacher output, not
+        # ground truth -- cf. FinetuneLoss, which also reads g["depthmap"]).
         pred_depth = torch.stack([p["depth"] for p in preds], dim=1).squeeze(-1)
-        gt_depth = torch.stack([g["depth"] for g in gts], dim=1).squeeze(-1)
+        gt_depth = torch.stack([g["depthmap"] for g in gts], dim=1)
         temp_mask = torch.stack([g["valid_mask"] for g in gts], dim=1)
 
         if not self.metric:
@@ -76,15 +79,17 @@ class DepthTrainLoss(MultiLoss):
         # ---------- Ldepth ----------
         depth_terms = []
         for g, p in zip(gts, preds):
-            if ("depth" in g) and ("depth" in p):
+            if "depth" in p:
                 sigma_p = p["depth_conf"]
-                sigma_g = g["depth_conf"]
                 valid_mask = g["valid_mask"]
                 if not valid_mask.any():
                     valid_mask = torch.ones_like(g["valid_mask"])
                 depth_terms.append(
                     self.depth_loss(
-                        p["depth"], g["depth"], sigma_p, sigma_g, valid_mask
+                        p["depth"],
+                        g["depthmap"].unsqueeze(-1),
+                        sigma_p=sigma_p,
+                        valid_mask=valid_mask,
                     )
                 )
         Ldepth = (
