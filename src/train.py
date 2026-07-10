@@ -181,10 +181,10 @@ def train(args):
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
-    train_criterion = loss_from_cfg(args.loss).build().to(device)
-    printer.info(f">> Creating train criterion = {train_criterion!r}")
-    test_loss = args.test_loss if args.get("test_loss") else args.loss
-    test_criterion = loss_from_cfg(test_loss).build().to(device)
+train_criterion = loss_from_cfg(args.loss).build().to(device)
+printer.info(f">> Creating train criterion = {train_criterion!r}")
+test_loss = args.test_loss if args.get("test_loss") is not None else args.loss
+test_criterion = loss_from_cfg(test_loss).build().to(device)
     printer.info(f">> Creating test criterion = {test_criterion!r}")
 
     model.to(device)
