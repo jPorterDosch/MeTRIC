@@ -10,7 +10,7 @@ os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from streamvggt.datasets.utils.geometry import (  # noqa: E402
+from .geometry import (  # noqa: E402
     colmap_to_opencv_intrinsics,
     opencv_to_colmap_intrinsics,
 )

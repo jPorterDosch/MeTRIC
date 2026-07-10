@@ -9,13 +9,11 @@ import numpy as np
 import PIL
 import torch
 
-import streamvggt.datasets.utils.cropping as cropping
-from streamvggt.datasets.base.easy_dataset import EasyDataset
-from streamvggt.datasets.utils.corr import extract_correspondences_from_pts3d
-from streamvggt.datasets.utils.geometry import (
-    depthmap_to_absolute_camera_coordinates,
-)
-from streamvggt.datasets.utils.transforms import ImgNorm, SeqColorJitter
+from ..utils import cropping
+from ..utils.corr import extract_correspondences_from_pts3d
+from ..utils.geometry import depthmap_to_absolute_camera_coordinates
+from ..utils.transforms import ImgNorm, SeqColorJitter
+from .easy_dataset import EasyDataset
 
 
 def get_ray_map(c2w1, c2w2, intrinsics, h, w):
@@ -70,10 +68,12 @@ class BaseMultiViewDataset(EasyDataset):
             or (
                 isinstance(self.n_corres, list) and len(self.n_corres) == self.num_views
             )
-        ), f"Error, n_corres should either be 'all', a single integer or a list of length {self.num_views}"
-        assert (
-            self.nneg == 0 or self.n_corres != "all"
-        ), "nneg should be 0 if n_corres is all"
+        ), (
+            f"Error, n_corres should either be 'all', a single integer or a list of length {self.num_views}"
+        )
+        assert self.nneg == 0 or self.n_corres != "all", (
+            "nneg should be 0 if n_corres is all"
+        )
 
         self.is_seq_color_jitter = False
         if isinstance(transform, str):
@@ -207,9 +207,9 @@ class BaseMultiViewDataset(EasyDataset):
             is_video: True if the views are consecutive
         """
         assert min_interval > 0, f"min_interval should be > 0, got {min_interval}"
-        assert (
-            min_interval <= max_interval
-        ), f"min_interval should be <= max_interval, got {min_interval} and {max_interval}"
+        assert min_interval <= max_interval, (
+            f"min_interval should be <= max_interval, got {min_interval} and {max_interval}"
+        )
         assert id_ref in ids_all
         pos_ref = ids_all.index(id_ref)
         all_possible_pos = np.arange(pos_ref, len(ids_all))
@@ -325,9 +325,7 @@ class BaseMultiViewDataset(EasyDataset):
             {self.split=},
             {self.seed=},
             resolutions={resolutions_str},
-            {self.transform=})""".replace(
-                "self.", ""
-            )
+            {self.transform=})""".replace("self.", "")
             .replace("\n", "")
             .replace("   ", "")
         )
@@ -368,9 +366,9 @@ class BaseMultiViewDataset(EasyDataset):
         transform = SeqColorJitter() if self.is_seq_color_jitter else self.transform
 
         for v, view in enumerate(views):
-            assert (
-                "pts3d" not in view
-            ), f"pts3d should not be there, they will be computed afterwards based on intrinsics+depthmap for view {view_name(view)}"
+            assert "pts3d" not in view, (
+                f"pts3d should not be there, they will be computed afterwards based on intrinsics+depthmap for view {view_name(view)}"
+            )
             view["idx"] = (idx, ar_idx, v)
 
             # encode the image
@@ -384,9 +382,9 @@ class BaseMultiViewDataset(EasyDataset):
             if "camera_pose" not in view:
                 view["camera_pose"] = np.full((4, 4), np.nan, dtype=np.float32)
             else:
-                assert np.isfinite(
-                    view["camera_pose"]
-                ).all(), f"NaN in camera pose for view {view_name(view)}"
+                assert np.isfinite(view["camera_pose"]).all(), (
+                    f"NaN in camera pose for view {view_name(view)}"
+                )
 
             ray_map = get_ray_map(
                 first_view_camera_pose,
@@ -399,9 +397,9 @@ class BaseMultiViewDataset(EasyDataset):
 
             assert "pts3d" not in view
             assert "valid_mask" not in view
-            assert np.isfinite(
-                view["depthmap"]
-            ).all(), f"NaN in depthmap for view {view_name(view)}"
+            assert np.isfinite(view["depthmap"]).all(), (
+                f"NaN in depthmap for view {view_name(view)}"
+            )
             pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
             view["pts3d"] = pts3d
@@ -439,12 +437,12 @@ class BaseMultiViewDataset(EasyDataset):
                 width = height = resolution
             else:
                 width, height = resolution
-            assert isinstance(
-                width, int
-            ), f"Bad type for {width=} {type(width)=}, should be int"
-            assert isinstance(
-                height, int
-            ), f"Bad type for {height=} {type(height)=}, should be int"
+            assert isinstance(width, int), (
+                f"Bad type for {width=} {type(width)=}, should be int"
+            )
+            assert isinstance(height, int), (
+                f"Bad type for {height=} {type(height)=}, should be int"
+            )
             self._resolutions.append((width, height))
 
     def _crop_resize_if_necessary(

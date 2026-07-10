@@ -4,7 +4,7 @@
 # import path for the batched sampler.
 import numpy as np
 
-from streamvggt.datasets.base.batched_sampler import (
+from .batched_sampler import (
     BatchedRandomSampler,
     CustomRandomSampler,
 )
@@ -127,9 +127,9 @@ class ResizedDataset(EasyDataset):
         assert len(self._idxs_mapping) == self.new_size
 
     def __getitem__(self, idx):
-        assert hasattr(
-            self, "_idxs_mapping"
-        ), "You need to call dataset.set_epoch() to use ResizedDataset.__getitem__()"
+        assert hasattr(self, "_idxs_mapping"), (
+            "You need to call dataset.set_epoch() to use ResizedDataset.__getitem__()"
+        )
         if isinstance(idx, tuple):
             idx, other, another = idx
             return self.dataset[self._idxs_mapping[idx], other, another]

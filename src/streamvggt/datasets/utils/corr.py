@@ -4,8 +4,8 @@
 # import paths for the device/geometry helpers, now sourced from this package.
 import numpy as np
 
-from streamvggt.datasets.utils.device import to_numpy
-from streamvggt.datasets.utils.geometry import inv, geotrf
+from .device import to_numpy
+from .geometry import inv, geotrf
 
 
 def reproject_view(pts3d, view2):

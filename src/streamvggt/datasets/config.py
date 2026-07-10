@@ -1,73 +1,45 @@
 """Tyro-exposable configuration for the streamvggt multi-view datasets.
 
 A single :class:`DatasetConfig` fully describes how to construct one dataset
-(HAMMER / ARKitScenes / ScanNet). It is a plain stdlib dataclass so it can be
-imported without tyro installed; ``tyro`` is only imported lazily inside
-:func:`cli`. Build a dataset object with ``DatasetConfig(...).build()``.
+(HAMMER / ARKitScenes / ScanNet). It is meant to be nested inside a training
+entrypoint's config (see ``finetune_depth.FinetuneDepthCfg``) so tyro exposes
+its fields as ``--dataset.root``, ``--dataset.max-interval`` etc.
 
 Design notes:
   * Fail fast. Every field that genuinely identifies the data (root, dataset,
     num_views, max_interval, resolution) is *required* -- there is no silent
-    default that would quietly load the wrong thing. Validation happens up
-    front in ``build()`` and again inside each dataset constructor.
+    default that would quietly load the wrong thing. ``validate()`` checks the
+    fields up front and each dataset constructor re-checks its own invariants.
   * No silent overwrite. ``is_metric`` and ``max_interval`` are plumbed through
-    to the dataset constructors instead of being hardcoded there, so a value
-    you pass is the value that is used.
+    to the dataset constructors instead of being hardcoded there.
+  * No ``eval``. The dataset is selected with a ``match`` over a
+    :class:`DatasetName` enum and the transform with a ``match`` over a
+    :class:`TransformName` enum -- never by evaluating a string.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from streamvggt.datasets.arkitscenes import ARKitScenes_Multi
-from streamvggt.datasets.base.base_multiview_dataset import BaseMultiViewDataset
-from streamvggt.datasets.hammer import HAMMER_Multi
-from streamvggt.datasets.scannet import ScanNet_Multi
-
-
-class Split(Enum):
-    """Train/test split. The value is the canonical string each dataset
-    constructor expects."""
-
-    TRAINING = "train"
-    TEST = "test"
-
-
-class DatasetName(Enum):
-    """Which dataset a :class:`DatasetConfig` builds."""
-
-    HAMMER = "hammer"
-    ARKITSCENES = "arkitscenes"
-    SCANNET = "scannet"
-
-
-# Single source of truth mapping the CLI enum to the concrete dataset class.
-DATASET_REGISTRY: dict[DatasetName, type[BaseMultiViewDataset]] = {
-    DatasetName.HAMMER: HAMMER_Multi,
-    DatasetName.ARKITSCENES: ARKitScenes_Multi,
-    DatasetName.SCANNET: ScanNet_Multi,
-}
+from .arkitscenes import ARKitScenes_Multi
+from .base.base_multiview_dataset import BaseMultiViewDataset
+from .types import DatasetName, Split, TransformName
+from .hammer import HAMMER_Multi
+from .scannet import ScanNet_Multi
+from .utils.transforms import ColorJitter, ImgNorm, SeqColorJitter
 
 
 @dataclass
 class DatasetConfig:
     """Construct one streamvggt multi-view dataset from CLI-friendly fields.
 
-    Example (tyro CLI)::
-
-        python -m streamvggt.datasets.config \\
-            --root /data/processed_hammer --dataset HAMMER \\
-            --num-views 4 --max-interval 20 --resolution 518 518 \\
-            --split TRAINING
-
     Example (Python)::
 
         cfg = DatasetConfig(
             root=Path("/data/processed_hammer"), dataset=DatasetName.HAMMER,
-            num_views=4, max_interval=20, resolution=(518, 518),
+            num_views=4, max_interval=20, resolution=((518, 518),),
         )
         dataset = cfg.build()
     """
@@ -81,11 +53,12 @@ class DatasetConfig:
     """Number of views per sample."""
     max_interval: int
     """Maximum frame interval when sampling a view sequence."""
-    resolution: tuple[int, int]
-    """Target (width, height) the images/depthmaps are cropped and resized to."""
+    resolution: tuple[tuple[int, int], ...]
+    """One or more (width, height) aspect ratios; a batch is sampled at a
+    single resolution, and multiple entries enable aspect-ratio augmentation."""
 
     # --- optional: sensible, explicit defaults ---
-    split: Split = Split.TRAINING
+    split: Split = Split.TRAIN
     """Train or test split."""
     is_metric: bool = True
     """Whether the depth/pose are in metric scale."""
@@ -99,37 +72,59 @@ class DatasetConfig:
     """Number of correspondences to extract per view (0 disables it)."""
     nneg: int = 0
     """Number of negative correspondences (only valid when ``n_corres`` > 0)."""
-    transform: str = "ImgNorm"
-    """Image transform name, resolved in the dataset transforms namespace
-    (e.g. ``ImgNorm`` or ``SeqColorJitter``)."""
+    transform: TransformName = TransformName.IMGNORM
+    """Image transform applied to every view."""
     seed: Optional[int] = None
     """Optional per-sample RNG seed for deterministic sampling."""
+    epoch_size: Optional[int] = None
+    """If set, resize the dataset to this many samples per epoch (the ``N @``
+    operator from EasyDataset); ``None`` leaves it at its natural length."""
 
-    def _validate(self) -> None:
+    def validate(self) -> "DatasetConfig":
+        """Coerce plain strings to enum members and fail fast on any
+        inconsistent field or missing data root."""
+        # coerce CLI/YAML/test strings to enum members (house style)
+        self.dataset = DatasetName(self.dataset)
+        self.split = Split(self.split)
+        self.transform = TransformName(self.transform)
         if self.num_views < 1:
             raise ValueError(f"num_views must be >= 1, got {self.num_views}")
         if self.max_interval < 1:
             raise ValueError(f"max_interval must be >= 1, got {self.max_interval}")
-        w, h = self.resolution
-        if w < 1 or h < 1:
-            raise ValueError(
-                f"resolution must be positive (width, height), got {self.resolution}"
-            )
+        if not self.resolution:
+            raise ValueError("resolution must list at least one (width, height)")
+        for wh in self.resolution:
+            if len(wh) != 2 or wh[0] < 1 or wh[1] < 1:
+                raise ValueError(
+                    f"each resolution must be a positive (width, height), got {wh!r}"
+                )
         if self.nneg and self.n_corres <= 0:
             raise ValueError("nneg requires n_corres > 0")
+        if self.epoch_size is not None and self.epoch_size < 1:
+            raise ValueError(f"epoch_size must be >= 1, got {self.epoch_size}")
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
+        return self
+
+    def _resolve_transform(self):
+        match self.transform:
+            case TransformName.IMGNORM:
+                return ImgNorm
+            case TransformName.SEQ_COLOR_JITTER:
+                return SeqColorJitter
+            case TransformName.COLOR_JITTER:
+                return ColorJitter
+            case _:
+                raise ValueError(f"Unknown transform: {self.transform!r}")
 
     def build(self) -> BaseMultiViewDataset:
-        """Instantiate and return the configured dataset (fails fast on any
-        inconsistent field or missing data root)."""
-        self._validate()
-        dataset_cls = DATASET_REGISTRY[self.dataset]
-        return dataset_cls(
+        """Instantiate and return the configured dataset."""
+        self.validate()
+        kwargs = dict(
             ROOT=str(self.root),
-            split=self.split.value,
+            split=self.split,
             num_views=self.num_views,
-            resolution=tuple(self.resolution),
+            resolution=[tuple(wh) for wh in self.resolution],
             max_interval=self.max_interval,
             is_metric=self.is_metric,
             aug_crop=self.aug_crop,
@@ -137,25 +132,24 @@ class DatasetConfig:
             seq_aug_crop=self.seq_aug_crop,
             n_corres=self.n_corres,
             nneg=self.nneg,
-            transform=self.transform,
+            transform=self._resolve_transform(),
             seed=self.seed,
         )
+        match self.dataset:
+            case DatasetName.HAMMER:
+                dataset = HAMMER_Multi(**kwargs)
+            case DatasetName.ARKITSCENES:
+                dataset = ARKitScenes_Multi(**kwargs)
+            case DatasetName.SCANNET:
+                dataset = ScanNet_Multi(**kwargs)
+            case _:
+                raise ValueError(f"Unknown dataset: {self.dataset!r}")
+
+        if self.epoch_size is not None:
+            dataset = self.epoch_size @ dataset  # EasyDataset.__rmatmul__
+        return dataset
 
 
 def build_dataset(config: DatasetConfig) -> BaseMultiViewDataset:
     """Functional alias for ``config.build()``."""
     return config.build()
-
-
-def cli() -> DatasetConfig:
-    """Parse a :class:`DatasetConfig` from the command line via tyro."""
-    import tyro
-
-    return tyro.cli(DatasetConfig)
-
-
-if __name__ == "__main__":
-    cfg = cli()
-    dataset = cfg.build()
-    print(dataset)
-    print(dataset.get_stats())

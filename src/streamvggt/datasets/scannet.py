@@ -5,8 +5,9 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from streamvggt.datasets.base.base_multiview_dataset import BaseMultiViewDataset
-from streamvggt.datasets.utils.image import imread_cv2
+from .base.base_multiview_dataset import BaseMultiViewDataset
+from .types import Split
+from .utils.image import imread_cv2
 
 # preserves the original DUSt3R ScanNet default; override via the constructor or
 # the DatasetConfig CLI rather than editing this constant.
@@ -36,17 +37,20 @@ class ScanNet_Multi(BaseMultiViewDataset):
             )
         self.max_interval = max_interval
         super().__init__(*args, **kwargs)
-        if self.split not in ("train", "test"):
-            raise ValueError(
-                f"ScanNet split must be 'train' or 'test', got {self.split!r}"
-            )
+        match self.split:
+            case Split.TRAIN:
+                subdir = "scans_train"
+            case Split.TEST:
+                subdir = "scans_test"
+            case _:
+                raise ValueError(
+                    f"ScanNet split must be Split.TRAIN or Split.TEST, got {self.split!r}"
+                )
 
-        self.loaded_data = self._load_data(self.split)
+        self.loaded_data = self._load_data(subdir)
 
-    def _load_data(self, split):
-        self.scene_root = osp.join(
-            self.ROOT, "scans_train" if split == "train" else "scans_test"
-        )
+    def _load_data(self, subdir):
+        self.scene_root = osp.join(self.ROOT, subdir)
         if not osp.isdir(self.scene_root):
             raise FileNotFoundError(
                 f"ScanNet split directory not found: {self.scene_root}"
@@ -172,5 +176,8 @@ class ScanNet_Multi(BaseMultiViewDataset):
                     reset=False,
                 )
             )
-        assert len(views) == num_views
+        if len(views) != num_views:
+            raise RuntimeError(
+                f"ScanNet produced {len(views)} views but {num_views} were requested"
+            )
         return views

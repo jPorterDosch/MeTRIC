@@ -4,8 +4,9 @@ import os.path as osp
 import cv2
 import numpy as np
 
-from streamvggt.datasets.base.base_multiview_dataset import BaseMultiViewDataset
-from streamvggt.datasets.utils.image import imread_cv2
+from .base.base_multiview_dataset import BaseMultiViewDataset
+from .types import Split
+from .utils.image import imread_cv2
 
 # preserves the original DUSt3R ARKitScenes default; override via the
 # constructor or the DatasetConfig CLI rather than editing this constant.
@@ -64,14 +65,16 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
             )
         self.max_interval = max_interval
         super().__init__(*args, **kwargs)
-        if self.split == "train":
-            self.split_dir = "Training"
-        elif self.split == "test":
-            self.split_dir = "Test"
-        else:
-            raise ValueError(
-                f"ARKitScenes split must be 'train' or 'test', got {self.split!r}"
-            )
+        match self.split:
+            case Split.TRAIN:
+                self.split_dir = "Training"
+            case Split.TEST:
+                self.split_dir = "Test"
+            case _:
+                raise ValueError(
+                    f"ARKitScenes split must be Split.TRAIN or Split.TEST, "
+                    f"got {self.split!r}"
+                )
 
         self.loaded_data = self._load_data(self.split_dir)
 
@@ -119,7 +122,11 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                     continue
 
                 collections = {}
-                assert "image_collection" in data, "Image collection not found"
+                if "image_collection" not in data:
+                    raise KeyError(
+                        f"{scene}: 'image_collection' missing from "
+                        "new_scene_metadata.npz"
+                    )
                 collections["image"] = data["image_collection"]
 
                 num_imgs = imgs.shape[0]
@@ -213,9 +220,11 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
             intrinsics = self.intrinsics[view_idx]
             camera_pose = self.trajectories[view_idx]
             basename = self.images[view_idx]
-            assert (
-                basename[:8] == self.scenes[scene_id]
-            ), f"{basename}, {self.scenes[scene_id]}"
+            if basename[:8] != self.scenes[scene_id]:
+                raise RuntimeError(
+                    f"ARKitScenes frame/scene mismatch: basename {basename!r} "
+                    f"does not belong to scene {self.scenes[scene_id]!r}"
+                )
             # Load RGB image
             rgb_image = imread_cv2(
                 osp.join(scene_dir, "vga_wide", basename.replace(".png", ".jpg"))
@@ -256,5 +265,8 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                     reset=False,
                 )
             )
-        assert len(views) == num_views
+        if len(views) != num_views:
+            raise RuntimeError(
+                f"ARKitScenes produced {len(views)} views but {num_views} were requested"
+            )
         return views
