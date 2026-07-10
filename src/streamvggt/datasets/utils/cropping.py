@@ -24,7 +24,7 @@ except AttributeError:
 
 
 class ImageList:
-    """Convenience class to aply the same operation to a whole set of images."""
+    """Convenience class to apply the same operation to a whole set of images."""
 
     def __init__(self, images):
         if not isinstance(images, (tuple, list, set)):

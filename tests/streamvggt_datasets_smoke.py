@@ -75,17 +75,30 @@ def check_self_contained():
                 dust3r_offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
     assert not dust3r_offenders, "imports dust3r: " + ", ".join(dust3r_offenders)
 
-    # the two entrypoints the audit called out must stay eval-free
-    for name in ("__init__.py", "config.py"):
-        src = (pkg_dir / name).read_text()
-        assert "eval(" not in src, f"eval( reintroduced in datasets/{name}"
-    print("  [1] self-contained: no dust3r imports, no eval() in __init__/config")
+    # ensure the datasets package stays eval-free (not just entrypoints)
+    eval_offenders = []
+    for path in pkg_dir.rglob("*.py"):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if "eval(" in line:
+                eval_offenders.append(f"{path.relative_to(ROOT)}:{lineno}")
+
+    assert not eval_offenders, "eval( found in: " + ", ".join(eval_offenders)
+    print("  [1] self-contained: no dust3r imports, no eval() in streamvggt.datasets")
 
 
 def check_registration():
-    for name in ("HAMMER_Multi", "ARKitScenes_Multi", "ScanNet_Multi",
-                 "DatasetConfig", "DatasetName", "Split", "TransformName",
-                 "get_data_loader", "build_dataset", "BatchedRandomSampler"):
+    for name in (
+        "HAMMER_Multi",
+        "ARKitScenes_Multi",
+        "ScanNet_Multi",
+        "DatasetConfig",
+        "DatasetName",
+        "Split",
+        "TransformName",
+        "get_data_loader",
+        "build_dataset",
+        "BatchedRandomSampler",
+    ):
         assert hasattr(D, name), f"missing export: {name}"
     assert {d.value for d in DatasetName} == {"hammer", "arkitscenes", "scannet"}
     print("  [2] registration + exports; DatasetName covers the built datasets")
@@ -95,22 +108,37 @@ def check_fail_fast():
     root = Path(ROOT)  # exists, so we reach the constructor-level checks
     # bad max_interval (config.validate)
     try:
-        DatasetConfig(root=root, dataset=DatasetName.HAMMER, num_views=4,
-                      max_interval=0, resolution=((518, 518),)).build()
+        DatasetConfig(
+            root=root,
+            dataset=DatasetName.HAMMER,
+            num_views=4,
+            max_interval=0,
+            resolution=((518, 518),),
+        ).build()
         raise AssertionError("bad max_interval did not raise")
     except ValueError:
         pass
     # missing root (config.validate)
     try:
-        DatasetConfig(root=Path("/no/such/root"), dataset=DatasetName.HAMMER,
-                      num_views=4, max_interval=20, resolution=((518, 518),)).build()
+        DatasetConfig(
+            root=Path("/no/such/root"),
+            dataset=DatasetName.HAMMER,
+            num_views=4,
+            max_interval=20,
+            resolution=((518, 518),),
+        ).build()
         raise AssertionError("missing root did not raise")
     except FileNotFoundError:
         pass
     # typo split reaches the dataset match-case fallback and is rejected
     try:
-        D.ScanNet_Multi(ROOT=str(root), split="trian", num_views=4,
-                        resolution=[(518, 518)], max_interval=30)
+        D.ScanNet_Multi(
+            ROOT=str(root),
+            split="trian",
+            num_views=4,
+            resolution=[(518, 518)],
+            max_interval=30,
+        )
         raise AssertionError("typo split did not raise")
     except ValueError:
         pass
@@ -119,9 +147,15 @@ def check_fail_fast():
 
 def check_enum_and_cli():
     # plain strings coerce to enum members (validate())
-    cfg = DatasetConfig(root=Path(ROOT), dataset="hammer", num_views=4,
-                        max_interval=5, resolution=((518, 518),),
-                        split="train", transform="imgnorm")
+    cfg = DatasetConfig(
+        root=Path(ROOT),
+        dataset="hammer",
+        num_views=4,
+        max_interval=5,
+        resolution=((518, 518),),
+        split="train",
+        transform="imgnorm",
+    )
     cfg.validate()
     assert cfg.dataset is DatasetName.HAMMER and cfg.split is Split.TRAIN
     assert cfg.transform is TransformName.IMGNORM
@@ -130,9 +164,24 @@ def check_enum_and_cli():
     import tyro
 
     argv = [
-        "--root", ROOT, "--dataset", "ARKITSCENES", "--num-views", "6",
-        "--max-interval", "11", "--resolution", "512", "384", "256", "256",
-        "--split", "TEST", "--transform", "SEQ_COLOR_JITTER", "--no-is-metric",
+        "--root",
+        ROOT,
+        "--dataset",
+        "ARKITSCENES",
+        "--num-views",
+        "6",
+        "--max-interval",
+        "11",
+        "--resolution",
+        "512",
+        "384",
+        "256",
+        "256",
+        "--split",
+        "TEST",
+        "--transform",
+        "SEQ_COLOR_JITTER",
+        "--no-is-metric",
     ]
     parsed = tyro.cli(DatasetConfig, args=argv)
     assert parsed.dataset is DatasetName.ARKITSCENES
@@ -150,9 +199,15 @@ def check_view_contract(data_dir):
         if not root.exists():
             print(f"  [5] {dsname.name}: SKIP (no data at {root})")
             continue
-        cfg = DatasetConfig(root=root, dataset=dsname, num_views=4,
-                            max_interval=max_interval, resolution=((518, 518),),
-                            split=Split.TRAIN, seed=42)
+        cfg = DatasetConfig(
+            root=root,
+            dataset=dsname,
+            num_views=4,
+            max_interval=max_interval,
+            resolution=((518, 518),),
+            split=Split.TRAIN,
+            seed=42,
+        )
         ds = cfg.build()
         # no silent overwrite
         assert ds.max_interval == max_interval and ds.is_metric is True
@@ -175,7 +230,9 @@ def check_view_contract(data_dir):
 
 
 def main():
-    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "scratch" / "data"
+    data_dir = (
+        Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "scratch" / "data"
+    )
     print("streamvggt.datasets smoke test")
     check_self_contained()
     check_registration()

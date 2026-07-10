@@ -84,7 +84,9 @@ def fetch_range(url, start, end, expected_len=None):
             wait = 2**attempt
             print(f"range {start}-{end} failed ({e}), retrying in {wait}s")
             time.sleep(wait)
-    raise RuntimeError(f"range {start}-{end} failed after {RETRIES} attempts: {last_err}")
+    raise RuntimeError(
+        f"range {start}-{end} failed after {RETRIES} attempts: {last_err}"
+    )
 
 
 def read_central_directory(url):
@@ -207,8 +209,7 @@ def extract_member(buf, group_start, member, out_root):
         raise RuntimeError(f"{member.name}: unsupported compression {member.method}")
     if len(content) != member.usize:
         raise RuntimeError(
-            f"{member.name}: decompressed {len(content)} bytes, "
-            f"expected {member.usize}"
+            f"{member.name}: decompressed {len(content)} bytes, expected {member.usize}"
         )
     if zlib.crc32(content) != member.crc:
         raise RuntimeError(f"{member.name}: CRC mismatch")
@@ -259,9 +260,7 @@ def main():
 
     groups = build_groups(todo, archive_end, args.chunk_mb << 20)
     fetch_bytes = sum(g["fetch_end"] - g["start"] + 1 for g in groups)
-    with tqdm(
-        total=fetch_bytes, unit="B", unit_scale=True, desc="Downloading"
-    ) as pbar:
+    with tqdm(total=fetch_bytes, unit="B", unit_scale=True, desc="Downloading") as pbar:
         for g in groups:
             buf = fetch_range(args.url, g["start"], g["fetch_end"])
             for m in g["members"]:
@@ -280,9 +279,7 @@ def main():
             f"{len(missing)} members missing/wrong size after download, "
             f"e.g. {missing[:3]}"
         )
-    n_seqs = len(
-        [d for d in os.listdir(args.out) if d.startswith("scene")]
-    )
+    n_seqs = len([d for d in os.listdir(args.out) if d.startswith("scene")])
     print(
         f"HAMMER download successful: {n_seqs} sequences, "
         f"{len(needed)} files, {total_bytes / 1e9:.1f} GB in {args.out}"

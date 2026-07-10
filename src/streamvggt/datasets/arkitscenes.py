@@ -81,18 +81,14 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
     def _load_data(self, split):
         with np.load(osp.join(self.ROOT, split, "all_metadata.npz")) as data:
             self.scenes: np.ndarray = data["scenes"]
-            high_res_list = np.array(
-                [
-                    d
-                    for d in os.listdir(
-                        os.path.join(
-                            self.ROOT.rstrip("/") + "_highres",
-                            split if split == "Training" else "Validation",
-                        )
-                    )
-                    if os.path.join(self.ROOT + "_highres", split, d)
-                ]
+            high_res_list = np.array([])
+            highres_root = os.path.join(
+                self.ROOT.rstrip("/") + "_highres",
+                "Training" if split == Split.TRAIN else "Validation",
             )
+            if os.path.isdir(highres_root):
+                high_res_list = np.array([d for d in os.listdir(highres_root)])
+
             self.scenes = np.setdiff1d(self.scenes, high_res_list)
         offset = 0
         counts = []

@@ -77,7 +77,9 @@ class BaseMultiViewDataset(EasyDataset):
 
         self.is_seq_color_jitter = False
         if isinstance(transform, str):
-            transform = eval(transform)
+            raise TypeError(
+                "transform must be a callable (e.g. ImgNorm/ColorJitter) or SeqColorJitter; string transforms are not supported"
+            )
         if transform == SeqColorJitter:
             transform = SeqColorJitter()
             self.is_seq_color_jitter = True

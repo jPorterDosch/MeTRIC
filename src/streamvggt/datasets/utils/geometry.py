@@ -16,7 +16,7 @@ def geotrf(Trf, pts, ncol=None, norm=False):
     p: numpy/torch/tuple of coordinates. Shape must be (...,2) or (...,3)
 
     ncol: int. number of columns of the result (2 or 3)
-    norm: float. if != 0, the resut is projected on the z=norm plane.
+    norm: float. if != 0, the result is projected on the z=norm plane.
 
     Returns an array of projected 2d points.
     """

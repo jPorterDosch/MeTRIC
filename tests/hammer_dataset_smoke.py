@@ -29,16 +29,37 @@ import torch  # noqa: E402
 from dust3r.datasets import *  # noqa: E402,F403 (mirrors get_data_loader's eval namespace)
 
 DATA_ROOT = (
-    sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/scratch/data/processed_hammer")
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else os.path.expanduser("~/scratch/data/processed_hammer")
 )
 NUM_VIEWS = 10
 RESOLUTION = (518, 392)
 EXPECTED_SEQS = {"train": 46, "test": 18}
 VIEW_KEYS = {
-    "img", "depthmap", "camera_pose", "camera_intrinsics", "dataset", "label",
-    "instance", "is_metric", "is_video", "quantile", "img_mask", "ray_mask",
-    "camera_only", "depth_only", "single_view", "reset", "idx", "true_shape",
-    "sky_mask", "ray_map", "pts3d", "valid_mask", "rng",
+    "img",
+    "depthmap",
+    "camera_pose",
+    "camera_intrinsics",
+    "dataset",
+    "label",
+    "instance",
+    "is_metric",
+    "is_video",
+    "quantile",
+    "img_mask",
+    "ray_mask",
+    "camera_only",
+    "depth_only",
+    "single_view",
+    "reset",
+    "idx",
+    "true_shape",
+    "sky_mask",
+    "ray_map",
+    "pts3d",
+    "valid_mask",
+    "rng",
 }
 
 

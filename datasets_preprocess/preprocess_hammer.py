@@ -199,9 +199,7 @@ def process_sequence(seq, input_dir, output_dir):
 
         pose = load_pose(pose_path, seq)
 
-        np.savez(
-            osp.join(out_cam_dir, f"{basename}.npz"), intrinsics=K, pose=pose
-        )
+        np.savez(osp.join(out_cam_dir, f"{basename}.npz"), intrinsics=K, pose=pose)
         # copy instead of re-encoding: keeps RGB and GT depth bit-exact
         shutil.copyfile(rgb_path, osp.join(out_rgb_dir, f"{basename}.png"))
         shutil.copyfile(depth_path, osp.join(out_depth_dir, f"{basename}.png"))
@@ -239,9 +237,7 @@ def main(input_dir, output_dir, num_workers):
             executor.submit(process_sequence, seq, input_dir, output_dir): seq
             for seq in sequences
         }
-        for future in tqdm(
-            as_completed(futures), total=len(futures), desc="Sequences"
-        ):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Sequences"):
             seq, n = future.result()  # re-raises the first worker error
             num_frames[seq] = n
 
