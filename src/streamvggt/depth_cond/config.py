@@ -10,6 +10,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import pathlib
 from dataclasses import dataclass, field
 
 
@@ -201,6 +202,8 @@ def experiment_manifest(cfg, exclude: tuple[str, ...] = ()) -> dict:
                     v = [x.value if isinstance(x, enum.Enum) else x for x in v]
                 elif isinstance(v, enum.Enum):
                     v = v.value
+                elif isinstance(v, pathlib.Path):
+                    v = str(v)
                 flat[key] = v
 
     _flatten("", d)

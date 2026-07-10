@@ -49,7 +49,14 @@ from streamvggt.depth_cond import (
     seed_everything,
     simulate_sparse_depth,
 )
-from finetune import save_current_code, setup_for_distributed, build_dataset  # reuse
+from finetune import save_current_code, setup_for_distributed  # reuse
+from streamvggt.datasets import (
+    DatasetConfig,
+    DatasetName,
+    Split,
+    TransformName,
+    get_data_loader,
+)
 from train_utils import picklable_args, resolve_output_dir, to_primitive
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
@@ -60,9 +67,17 @@ printer = get_logger(__name__, log_level="DEBUG")
 WANDB_PROJECT = "MeTRIC"
 WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
 
-_DEFAULT_RESOLUTIONS = (
-    "[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), "
-    "(392, 518), (336, 518), (294, 518), (266, 518)]"
+_ARKITSCENES_RESOLUTIONS = (
+    (518, 392),
+    (518, 336),
+    (518, 294),
+    (518, 266),
+    (518, 210),
+    (518, 154),
+    (392, 518),
+    (336, 518),
+    (294, 518),
+    (266, 518),
 )
 
 
@@ -96,17 +111,28 @@ class FinetuneDepthCfg:
     warmup_epochs: float = 0.5
     amp: int = 1
 
-    # data
-    num_views: int = 10
+    # data -- the dataset is a nested config (tyro exposes --dataset.root,
+    # --dataset.max-interval, ...). It is the single source of truth for
+    # num_views/resolution; build it with dataset.build() instead of eval-ing
+    # a string.
+    dataset: DatasetConfig = field(
+        default_factory=lambda: DatasetConfig(
+            root=Path("../data/train/processed_arkitscenes/"),
+            dataset=DatasetName.ARKITSCENES,
+            num_views=10,
+            max_interval=8,
+            resolution=_ARKITSCENES_RESOLUTIONS,
+            split=Split.TRAIN,
+            is_metric=True,
+            aug_crop=16,
+            transform=TransformName.SEQ_COLOR_JITTER,
+            n_corres=0,
+            epoch_size=4500,
+        )
+    )
     num_workers: int = 12
     fixed_length: bool = True
     benchmark: bool = False
-    train_dataset: str = (
-        "4500 @ ARKitScenes_Multi(allow_repeat=False, split='train', "
-        "ROOT='../data/train/processed_arkitscenes/', aug_crop=16, "
-        f"resolution={_DEFAULT_RESOLUTIONS}, transform=SeqColorJitter, "
-        "num_views=10, n_corres=0)"
-    )
     train_criterion: str = (
         "ConfLoss(Regr3DPose(L21, norm_mode='?avg_dis'), alpha=0.2) + FinetuneLoss()"
     )
@@ -217,13 +243,15 @@ def train(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
-    printer.info("Building train dataset %s", args.train_dataset)
-    data_loader_train = build_dataset(
-        args.train_dataset,
-        args.batch_size,
-        args.num_workers,
+    printer.info("Building train dataset %s", args.dataset)
+    train_dataset = args.dataset.build()
+    data_loader_train = get_data_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+        drop_last=True,
         accelerator=accelerator,
-        test=False,
         fixed_length=args.fixed_length,
     )
 
