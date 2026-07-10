@@ -13,6 +13,7 @@ import argparse
 import dataclasses
 import enum
 import os
+import pathlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -69,6 +70,8 @@ def to_primitive(obj):
     without needing any project module to reconstruct it."""
     if isinstance(obj, enum.Enum):
         return obj.value
+    if isinstance(obj, pathlib.Path):
+        return str(obj)
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {
             f.name: to_primitive(getattr(obj, f.name)) for f in dataclasses.fields(obj)
