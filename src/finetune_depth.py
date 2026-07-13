@@ -51,6 +51,7 @@ from streamvggt.depth_cond import (
 )
 from finetune import save_current_code, setup_for_distributed  # reuse
 from streamvggt.datasets import (
+    CatDataset,
     DatasetName,
     MultiDatasetConfig,
     Split,
@@ -65,7 +66,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 printer = get_logger(__name__, log_level="DEBUG")
 
 WANDB_PROJECT = "MeTRIC"
-WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
+WANDB_ENTITY = "sparse_representation_learning"
 
 _ARKITSCENES_RESOLUTIONS = (
     (518, 392),
@@ -131,6 +132,13 @@ class FinetuneDepthCfg:
             ),
             max_interval=(8, 8),
             epoch_size=(4500, 2250),
+            # the lowres loader excludes the highres tree's scenes; pass the
+            # real root explicitly so the partition cannot silently break if
+            # the roots stop following the <x>/<x>_highres naming convention
+            highres_root=(
+                Path("../data/train/processed_arkitscenes_highres/"),
+                None,
+            ),
             num_views=10,
             resolution=_ARKITSCENES_RESOLUTIONS,
             split=Split.TRAIN,
@@ -179,6 +187,29 @@ _NON_IDENTITY_FIELDS = (
 
 def build_manifest(cfg: FinetuneDepthCfg) -> dict:
     return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
+
+
+def build_train_loader(
+    args: FinetuneDepthCfg, accelerator
+) -> torch.utils.data.DataLoader:
+    """Build the training mixture (one CatDataset over every configured
+    dataset, mirroring the original `N @ ds1 + M @ ds2` recipes) and wrap it
+    in the batched-sampler loader. 
+    """
+    printer.info("Building train datasets %s", args.dataset)
+    train_datasets = args.dataset.build_all()
+    train_dataset = (
+        train_datasets[0] if len(train_datasets) == 1 else CatDataset(train_datasets)
+    )
+    return get_data_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+        drop_last=True,
+        accelerator=accelerator,
+        fixed_length=args.fixed_length,
+    )
 
 
 def build_model(
@@ -256,22 +287,7 @@ def run(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
-    printer.info("Building train datasets %s", args.dataset)
-    # build each configured dataset, then concatenate with `+` (CatDataset) --
-    # the EasyDataset operator the original `N @ ds1 + M @ ds2` recipes used
-    train_datasets = args.dataset.build_all()
-    train_dataset = train_datasets[0]
-    for extra_dataset in train_datasets[1:]:
-        train_dataset = train_dataset + extra_dataset
-    data_loader_train = get_data_loader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        drop_last=True,
-        accelerator=accelerator,
-        fixed_length=args.fixed_length,
-    )
+    data_loader_train = build_train_loader(args, accelerator)
 
     printer.info("Loading depth-conditioned model")
     model, _ = build_model(args, mcfg, device)

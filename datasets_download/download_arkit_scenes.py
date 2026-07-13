@@ -244,9 +244,11 @@ def download_data(
     # the laser scanner path downloads a shared mapping csv; serialize it so
     # parallel workers cannot race on the same file
     laser_scanner_lock = threading.Lock()
+    # O(1) split lookup instead of an O(n) list.index scan per video
+    split_by_id = dict(zip(video_ids, dataset_splits))
 
     def process_video(video_id):
-        split = dataset_splits[video_ids.index(video_id)]
+        split = split_by_id[video_id]
         dst_dir = os.path.join(download_dir, dataset, split)
         if dataset == "raw":
             url_prefix = ""

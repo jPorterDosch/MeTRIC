@@ -4,13 +4,15 @@ import os.path as osp
 import cv2
 import numpy as np
 
-from .base.base_multiview_dataset import BaseMultiViewDataset
+from .arkitscenes import DEFAULT_MAX_INTERVAL
+from .base.base_multiview_dataset import (
+    BaseMultiViewDataset,
+    EmptyDatasetError,
+    intrinsics_rows_to_K,
+    validate_max_interval,
+)
 from .types import Split
 from .utils.image import imread_cv2
-
-# preserves the original DUSt3R ARKitScenesHighRes default; override via the
-# constructor or the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 8
 
 
 class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
@@ -38,12 +40,7 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        if not isinstance(max_interval, int) or max_interval < 1:
-            raise ValueError(
-                f"ARKitScenesHighRes max_interval must be a positive int, "
-                f"got {max_interval!r}"
-            )
-        self.max_interval = max_interval
+        self.max_interval = validate_max_interval(max_interval, "ARKitScenesHighRes")
         super().__init__(*args, **kwargs)
         match self.split:
             case Split.TRAIN:
@@ -72,35 +69,32 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
         images = []
         start_img_ids = []
         scene_img_list = []
-        timestamps = []
         intrinsics = []
         trajectories = []
         scene_id = 0
         for scene in all_scenes:
             scene_dir = osp.join(self.ROOT, split, scene)
             with np.load(osp.join(scene_dir, "scene_metadata.npz")) as data:
+                # order frames by NUMERIC timestamp ("{scene}_{t}.png"); a
+                # lexicographic filename sort misorders any scene whose
+                # timestamps cross a digit boundary (e.g. "98.764" sorts
+                # after "101.663"), corrupting is_video sequence ordering
                 imgs_with_indices = sorted(
-                    enumerate(data["images"]), key=lambda x: x[1]
+                    enumerate(data["images"]),
+                    key=lambda x: float(x[1].split("_")[1][:-4]),
                 )
                 imgs = [x[1] for x in imgs_with_indices]
-                cut_off = (
-                    self.num_views
-                    if not self.allow_repeat
-                    else max(self.num_views // 3, 3)
-                )
+                cut_off = self.min_views()
                 if len(imgs) < cut_off:
                     print(f"Skipping {scene}")
                     continue
                 indices = [x[0] for x in imgs_with_indices]
-                tsps = np.array(
-                    [float(img_name.split("_")[1][:-4]) for img_name in imgs]
-                )
                 if not all(img[:8] == scene for img in imgs):
                     raise RuntimeError(
                         f"ARKitScenesHighRes frame/scene mismatch in {scene}: "
                         f"{[img for img in imgs if img[:8] != scene][:3]}"
                     )
-                num_imgs = data["images"].shape[0]
+                num_imgs = len(imgs)
                 img_ids = list(np.arange(num_imgs) + offset)
                 start_img_ids_ = img_ids[: num_imgs - cut_off + 1]
 
@@ -109,15 +103,10 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
                 sceneids.extend([scene_id] * num_imgs)
                 images.extend(imgs)
                 start_img_ids.extend(start_img_ids_)
-                timestamps.extend(tsps)
 
-                K = np.expand_dims(np.eye(3), 0).repeat(num_imgs, 0)
-                intrins = data["intrinsics"][indices]
-                K[:, 0, 0] = [fx for _, _, fx, _, _, _ in intrins]
-                K[:, 1, 1] = [fy for _, _, _, fy, _, _ in intrins]
-                K[:, 0, 2] = [cx for _, _, _, _, cx, _ in intrins]
-                K[:, 1, 2] = [cy for _, _, _, _, _, cy in intrins]
-                intrinsics.extend(list(K))
+                intrinsics.extend(
+                    list(intrinsics_rows_to_K(data["intrinsics"][indices]))
+                )
                 trajectories.extend(list(data["trajectories"][indices]))
 
                 # offset groups
@@ -127,7 +116,7 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
         if not scenes:
             # distinguishes a stub / partially-downloaded tree from a real one
             # here, instead of an IndexError at sampling time
-            raise RuntimeError(
+            raise EmptyDatasetError(
                 f"ARKitScenesHighRes found no usable scenes under "
                 f"{osp.join(self.ROOT, split)}"
             )

@@ -83,6 +83,11 @@ class DatasetConfig:
     epoch_size: Optional[int] = None
     """If set, resize the dataset to this many samples per epoch (the ``N @``
     operator from EasyDataset); ``None`` leaves it at its natural length."""
+    highres_root: Optional[Path] = None
+    """ARKITSCENES_LOWRES only: explicit root of the highres sibling tree whose
+    scenes the lowres loader excludes (fails fast if missing). ``None`` falls
+    back to the original DUSt3R convention of deriving ``ROOT + "_highres"``
+    and silently skipping exclusion when that tree is absent."""
 
     def validate(self) -> "DatasetConfig":
         """Coerce plain strings to enum members and fail fast on any
@@ -106,6 +111,14 @@ class DatasetConfig:
             raise ValueError("nneg requires n_corres > 0")
         if self.epoch_size is not None and self.epoch_size < 1:
             raise ValueError(f"epoch_size must be >= 1, got {self.epoch_size}")
+        if (
+            self.highres_root is not None
+            and self.dataset is not DatasetName.ARKITSCENES_LOWRES
+        ):
+            raise ValueError(
+                f"highres_root only applies to {DatasetName.ARKITSCENES_LOWRES}, "
+                f"got dataset={self.dataset}"
+            )
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
         return self
@@ -143,7 +156,12 @@ class DatasetConfig:
             case DatasetName.HAMMER:
                 dataset = HAMMER_Multi(**kwargs)
             case DatasetName.ARKITSCENES_LOWRES:
-                dataset = ARKitScenes_Multi(**kwargs)
+                dataset = ARKitScenes_Multi(
+                    highres_root=(
+                        None if self.highres_root is None else str(self.highres_root)
+                    ),
+                    **kwargs,
+                )
             case DatasetName.ARKITSCENES_HIGHRES:
                 dataset = ARKitScenesHighRes_Multi(**kwargs)
             case DatasetName.SCANNET:
@@ -205,6 +223,11 @@ class MultiDatasetConfig:
     per dataset or omitted entirely (natural lengths)."""
     is_metric: Optional[tuple[bool, ...]] = None
     """Per-dataset metric-scale flags; omitted means metric for all."""
+    highres_root: Optional[tuple[Optional[Path], ...]] = None
+    """Per-dataset explicit highres exclusion root (see
+    ``DatasetConfig.highres_root``); only meaningful for ARKITSCENES_LOWRES
+    entries -- use ``None`` for the others. Omitted means the DUSt3R naming
+    convention for every dataset."""
 
     # --- shared, optional ---
     split: Split = Split.TRAIN
@@ -231,6 +254,7 @@ class MultiDatasetConfig:
             ("max_interval", self.max_interval),
             ("epoch_size", self.epoch_size),
             ("is_metric", self.is_metric),
+            ("highres_root", self.highres_root),
         ):
             if values is not None and len(values) != n:
                 raise ValueError(
@@ -260,6 +284,9 @@ class MultiDatasetConfig:
                 transform=self.transform,
                 seed=self.seed,
                 epoch_size=None if self.epoch_size is None else self.epoch_size[i],
+                highres_root=(
+                    None if self.highres_root is None else self.highres_root[i]
+                ),
             )
             if i == 0:
                 # a DatasetConfig knob this fan-out does not pass would

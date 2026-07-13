@@ -11,7 +11,9 @@ config), and :mod:`streamvggt.datasets.types` for the ``Split`` / ``DatasetName`
 
 from .arkitscenes import ARKitScenes_Multi
 from .arkitscenes_highres import ARKitScenesHighRes_Multi
+from .base.base_multiview_dataset import EmptyDatasetError
 from .base.batched_sampler import BatchedRandomSampler
+from .base.easy_dataset import CatDataset
 from .config import DatasetConfig, MultiDatasetConfig, build_dataset
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
@@ -26,7 +28,9 @@ __all__ = [
     "HAMMER_Multi",
     "ScanNet_Multi",
     "BatchedRandomSampler",
+    "CatDataset",
     "DatasetConfig",
+    "EmptyDatasetError",
     "MultiDatasetConfig",
     "build_dataset",
     "DatasetName",
