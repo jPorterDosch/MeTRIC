@@ -66,7 +66,7 @@ def check_overfit() -> None:
             patch_size=mcfg.depth_cond.sim_patch_size,
             mask_ratio=mcfg.depth_cond.sim_mask_ratio,
         )
-        losses = overfit_steps(model, batch, cfg.train_criterion, steps=5)
+        losses = overfit_steps(model, batch, cfg.loss, steps=5)
         rises = sum(1 for a, b in zip(losses, losses[1:]) if b > a)
         print(
             f"[stage7] {injection.value}: {losses[0]:.4f} -> {losses[-1]:.4f} (rises {rises})"

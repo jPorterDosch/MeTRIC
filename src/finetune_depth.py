@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
-from streamvggt.loss.loss import *  # noqa: F401,F403 needed to eval() the criterion strings
+from streamvggt.loss import LossConfig
 from dust3r.inference import loss_of_one_batch  # noqa
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
@@ -133,9 +133,13 @@ class FinetuneDepthCfg:
     num_workers: int = 12
     fixed_length: bool = True
     benchmark: bool = False
-    train_criterion: str = (
-        "ConfLoss(Regr3DPose(L21, norm_mode='?avg_dis'), alpha=0.2) + FinetuneLoss()"
-    )
+
+    # Training objective. tyro exposes the knobs as e.g. --loss.recipe,
+    # --loss.pixel-loss, --loss.conf-alpha. The default recipe is DEPTH_TRAIN
+    # (DepthTrainLoss: temporal depth-gradient consistency + depth accuracy);
+    # pass --loss.recipe finetune_train for the historical
+    #   ConfLoss(Regr3DPose(L21, norm_mode='?avg_dis'), alpha=0.2) + FinetuneLoss()
+    loss: LossConfig = field(default_factory=LossConfig)
 
     # logging / saving cadence (not part of the experiment identity)
     print_freq: int = 10
@@ -258,8 +262,8 @@ def train(
     printer.info("Loading depth-conditioned model")
     model, _ = build_model(args, mcfg, device)
 
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
+    train_criterion = args.loss.build().to(device)
+    printer.info(f">> Creating train criterion = {train_criterion!r}")
 
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))

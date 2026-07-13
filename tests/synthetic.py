@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 from common import ROOT  # noqa: F401  (sets sys.path)
 
 from dust3r.inference import loss_of_one_batch
-from streamvggt.loss.loss import *  # noqa: F401,F403  needed to eval() criterion strings
+from streamvggt.loss import LossConfig
 
 
 def make_synthetic_clip(
@@ -58,7 +58,7 @@ def make_synthetic_clip(
 def overfit_steps(
     model: torch.nn.Module,
     batch: list[dict],
-    criterion_str: str,
+    loss_cfg: LossConfig,
     steps: int = 5,
     lr: float = 1e-4,
 ) -> list[float]:
@@ -66,7 +66,7 @@ def overfit_steps(
     returns the per-step losses."""
 
     device = next(model.parameters()).device
-    criterion = eval(criterion_str).to(device)
+    criterion = loss_cfg.build().to(device)
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=lr, betas=(0.9, 0.95))
