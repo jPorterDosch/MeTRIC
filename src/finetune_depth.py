@@ -194,7 +194,7 @@ def build_train_loader(
 ) -> torch.utils.data.DataLoader:
     """Build the training mixture (one CatDataset over every configured
     dataset, mirroring the original `N @ ds1 + M @ ds2` recipes) and wrap it
-    in the batched-sampler loader. 
+    in the batched-sampler loader.
     """
     printer.info("Building train datasets %s", args.dataset)
     train_datasets = args.dataset.build_all()
