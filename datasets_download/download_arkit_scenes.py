@@ -3,6 +3,8 @@ import subprocess
 import pandas as pd
 import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ARkitscense_url = (
     "https://docs-assets.developer.apple.com/ml-research/datasets/arkitscenes/v1"
@@ -231,6 +233,7 @@ def download_data(
     keep_zip,
     raw_dataset_assets,
     should_download_laser_scanner_point_cloud,
+    num_workers=1,
 ):
     metadata = get_metadata(dataset, download_dir)
     if None is metadata:
@@ -238,8 +241,14 @@ def download_data(
         return
 
     download_dir = os.path.abspath(download_dir)
-    for video_id in sorted(set(video_ids)):
-        split = dataset_splits[video_ids.index(video_id)]
+    # the laser scanner path downloads a shared mapping csv; serialize it so
+    # parallel workers cannot race on the same file
+    laser_scanner_lock = threading.Lock()
+    # O(1) split lookup instead of an O(n) list.index scan per video
+    split_by_id = dict(zip(video_ids, dataset_splits))
+
+    def process_video(video_id):
+        split = split_by_id[video_id]
         dst_dir = os.path.join(download_dir, dataset, split)
         if dataset == "raw":
             url_prefix = ""
@@ -265,9 +274,10 @@ def download_data(
 
         if should_download_laser_scanner_point_cloud and dataset == "raw":
             # Point clouds only available for the raw dataset
-            download_laser_scanner_point_clouds_for_video(
-                video_id, metadata, download_dir
-            )
+            with laser_scanner_lock:
+                download_laser_scanner_point_clouds_for_video(
+                    video_id, metadata, download_dir
+                )
 
         for file_name in file_names:
             dst_path = os.path.join(dst_dir, file_name)
@@ -281,6 +291,29 @@ def download_data(
                 print(f"WARNING: skipping download of existing zip file: {dst_path}")
             if file_name.endswith(".zip") and os.path.isfile(dst_path):
                 unzip_file(file_name, dst_dir, keep_zip)
+
+    unique_video_ids = sorted(set(video_ids))
+    if num_workers <= 1:
+        for video_id in unique_video_ids:
+            process_video(video_id)
+    else:
+        # videos are independent (each downloads into its own directory), so
+        # parallelize across videos; download_file / unzip_file behavior and
+        # the per-file skip/resume logic are unchanged
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(process_video, video_id): video_id
+                for video_id in unique_video_ids
+            }
+            done = 0
+            for future in as_completed(futures):
+                video_id = futures[future]
+                try:
+                    future.result()
+                except Exception as error:
+                    print(f"Error processing video id {video_id}, error: {error}")
+                done += 1
+                print(f"Progress: {done}/{len(unique_video_ids)} video ids processed")
 
     if dataset == "upsampling" and VALIDATION in dataset_splits:
         val_attributes_file = "val_attributes.csv"
@@ -318,6 +351,13 @@ if __name__ == "__main__":
         "--raw_dataset_assets", nargs="+", choices=default_raw_dataset_assets
     )
 
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="number of parallel download workers (1 = original sequential behavior)",
+    )
+
     args = parser.parse_args()
     assert args.video_id is not None or args.video_id_csv is not None, (
         "video_id or video_id_csv must be specified"
@@ -352,4 +392,5 @@ if __name__ == "__main__":
         args.keep_zip,
         args.raw_dataset_assets,
         args.download_laser_scanner_point_cloud,
+        args.num_workers,
     )

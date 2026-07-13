@@ -51,8 +51,9 @@ from streamvggt.depth_cond import (
 )
 from finetune import save_current_code, setup_for_distributed  # reuse
 from streamvggt.datasets import (
-    DatasetConfig,
+    CatDataset,
     DatasetName,
+    MultiDatasetConfig,
     Split,
     TransformName,
     get_data_loader,
@@ -65,7 +66,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 printer = get_logger(__name__, log_level="DEBUG")
 
 WANDB_PROJECT = "MeTRIC"
-WANDB_ENTITY = "jporterdosch-university-of-tennessee-knoxville"
+WANDB_ENTITY = "sparse_representation_learning"
 
 _ARKITSCENES_RESOLUTIONS = (
     (518, 392),
@@ -111,23 +112,39 @@ class FinetuneDepthCfg:
     warmup_epochs: float = 0.5
     amp: int = 1
 
-    # data -- the dataset is a nested config (tyro exposes --dataset.root,
-    # --dataset.max-interval, ...). It is the single source of truth for
-    # num_views/resolution; build it with dataset.build() instead of eval-ing
-    # a string.
-    dataset: DatasetConfig = field(
-        default_factory=lambda: DatasetConfig(
-            root=Path("../data/train/processed_arkitscenes/"),
-            dataset=DatasetName.ARKITSCENES,
+    # data -- the datasets are a nested config of parallel per-dataset tuples
+    # (tyro exposes --dataset.root A B, --dataset.dataset arkitscenes_lowres
+    # arkitscenes_highres, --dataset.epoch-size 4500 2250, ...); entry i of
+    # every tuple describes dataset i and lengths are validated up front. It is
+    # the single source of truth for num_views/resolution (shared across the
+    # mixture); build with dataset.build_all() and concatenate -- no eval.
+    # The default reproduces the original recipe's ARKitScenes slice:
+    # 4500 @ lowres + 2250 @ highres (the loaders partition the scenes).
+    dataset: MultiDatasetConfig = field(
+        default_factory=lambda: MultiDatasetConfig(
+            root=(
+                Path("../data/train/processed_arkitscenes/"),
+                Path("../data/train/processed_arkitscenes_highres/"),
+            ),
+            dataset=(
+                DatasetName.ARKITSCENES_LOWRES,
+                DatasetName.ARKITSCENES_HIGHRES,
+            ),
+            max_interval=(8, 8),
+            epoch_size=(4500, 2250),
+            # the lowres loader excludes the highres tree's scenes; pass the
+            # real root explicitly so the partition cannot silently break if
+            # the roots stop following the <x>/<x>_highres naming convention
+            highres_root=(
+                Path("../data/train/processed_arkitscenes_highres/"),
+                None,
+            ),
             num_views=10,
-            max_interval=8,
             resolution=_ARKITSCENES_RESOLUTIONS,
             split=Split.TRAIN,
-            is_metric=True,
             aug_crop=16,
             transform=TransformName.SEQ_COLOR_JITTER,
             n_corres=0,
-            epoch_size=4500,
         )
     )
     num_workers: int = 12
@@ -172,6 +189,29 @@ def build_manifest(cfg: FinetuneDepthCfg) -> dict:
     return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
 
 
+def build_train_loader(
+    args: FinetuneDepthCfg, accelerator
+) -> torch.utils.data.DataLoader:
+    """Build the training mixture (one CatDataset over every configured
+    dataset, mirroring the original `N @ ds1 + M @ ds2` recipes) and wrap it
+    in the batched-sampler loader.
+    """
+    printer.info("Building train datasets %s", args.dataset)
+    train_datasets = args.dataset.build_all()
+    train_dataset = (
+        train_datasets[0] if len(train_datasets) == 1 else CatDataset(train_datasets)
+    )
+    return get_data_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+        drop_last=True,
+        accelerator=accelerator,
+        fixed_length=args.fixed_length,
+    )
+
+
 def build_model(
     args: FinetuneDepthCfg,
     mcfg: MetricCfg,
@@ -198,7 +238,7 @@ def build_model(
     return model, stats
 
 
-def train(
+def run(
     args: FinetuneDepthCfg, mcfg: MetricCfg, manifest: dict, run_hash: str, run_id: str
 ) -> None:
     accelerator = Accelerator(
@@ -247,17 +287,7 @@ def train(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
-    printer.info("Building train dataset %s", args.dataset)
-    train_dataset = args.dataset.build()
-    data_loader_train = get_data_loader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        drop_last=True,
-        accelerator=accelerator,
-        fixed_length=args.fixed_length,
-    )
+    data_loader_train = build_train_loader(args, accelerator)
 
     printer.info("Loading depth-conditioned model")
     model, _ = build_model(args, mcfg, device)
@@ -482,7 +512,7 @@ def main(cfg: FinetuneDepthCfg) -> None:
     cfg.output_dir = resolve_output_dir(cfg, run_id)
     print(f"Experiment {cfg.exp_name} id {run_id} -> {cfg.output_dir}")
 
-    train(cfg, mcfg, manifest, run_hash, run_id)
+    run(cfg, mcfg, manifest, run_hash, run_id)
 
 
 if __name__ == "__main__":

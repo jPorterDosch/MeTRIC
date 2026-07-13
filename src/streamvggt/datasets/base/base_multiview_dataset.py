@@ -16,6 +16,35 @@ from ..utils.transforms import ImgNorm, SeqColorJitter
 from .easy_dataset import EasyDataset
 
 
+class EmptyDatasetError(RuntimeError):
+    """A dataset root exists but yielded no usable scenes (stub or partially
+    downloaded tree). Raised at construction so the misconfiguration surfaces
+    immediately instead of as an IndexError at sampling time; catch by type,
+    not by message text."""
+
+
+def validate_max_interval(max_interval, dataset_name):
+    """Shared constructor guard: max_interval must be a positive int."""
+    if not isinstance(max_interval, int) or max_interval < 1:
+        raise ValueError(
+            f"{dataset_name} max_interval must be a positive int, got {max_interval!r}"
+        )
+    return max_interval
+
+
+def intrinsics_rows_to_K(intrins):
+    """Build (N, 3, 3) pinhole K matrices from (N, 6) rows laid out as
+    (w, h, fx, fy, cx, cy) -- the scene_metadata.npz convention shared by the
+    ARKitScenes preprocess outputs."""
+    intrins = np.asarray(intrins)
+    K = np.expand_dims(np.eye(3), 0).repeat(len(intrins), 0)
+    K[:, 0, 0] = intrins[:, 2]
+    K[:, 1, 1] = intrins[:, 3]
+    K[:, 0, 2] = intrins[:, 4]
+    K[:, 1, 2] = intrins[:, 5]
+    return K
+
+
 def get_ray_map(c2w1, c2w2, intrinsics, h, w):
     c2w = np.linalg.inv(c2w1) @ c2w2
     i, j = np.meshgrid(np.arange(w), np.arange(h), indexing="xy")
@@ -89,6 +118,11 @@ class BaseMultiViewDataset(EasyDataset):
         self.seed = seed
         self.allow_repeat = allow_repeat
         self.seq_aug_crop = seq_aug_crop
+
+    def min_views(self):
+        """Minimum usable frames for a scene: num_views, or the reduced floor
+        when allow_repeat lets short sequences be padded by repetition."""
+        return self.num_views if not self.allow_repeat else max(self.num_views // 3, 3)
 
     def __len__(self):
         return len(self.scenes)

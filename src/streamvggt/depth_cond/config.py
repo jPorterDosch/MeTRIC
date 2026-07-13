@@ -192,19 +192,25 @@ def experiment_manifest(cfg, exclude: tuple[str, ...] = ()) -> dict:
         d.pop(k, None)
     flat: dict = {}
 
+    def _jsonable(v):
+        # recursive: enums/Paths must be converted at ANY nesting depth
+        # (e.g. tuple[Path, ...] dataset roots), else json.dumps in
+        # experiment_hash raises TypeError
+        if isinstance(v, enum.Enum):
+            return v.value
+        if isinstance(v, pathlib.Path):
+            return str(v)
+        if isinstance(v, (list, tuple)):
+            return [_jsonable(x) for x in v]
+        return v
+
     def _flatten(prefix: str, obj: dict) -> None:
         for k, v in obj.items():
             key = f"{prefix}.{k}" if prefix else k
             if isinstance(v, dict):
                 _flatten(key, v)
             else:
-                if isinstance(v, (list, tuple)):
-                    v = [x.value if isinstance(x, enum.Enum) else x for x in v]
-                elif isinstance(v, enum.Enum):
-                    v = v.value
-                elif isinstance(v, pathlib.Path):
-                    v = str(v)
-                flat[key] = v
+                flat[key] = _jsonable(v)
 
     _flatten("", d)
     return flat

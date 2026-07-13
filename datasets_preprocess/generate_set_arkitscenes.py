@@ -53,8 +53,11 @@ def process_scene(root, split, scene, max_interval):
         intrinsics = data["intrinsics"]
         pairs = data["pairs"]
 
-    # Sort images by timestep
-    imgs_with_indices = sorted(enumerate(images), key=lambda x: x[1])
+    # Sort images by NUMERIC timestep -- a lexicographic filename sort
+    # misorders scenes whose timestamps cross a digit boundary (e.g. "98.764"
+    # sorts after "101.663"), which breaks the video_collection windows below
+    # (their early-`break` assumes monotonically increasing timestamps)
+    imgs_with_indices = sorted(enumerate(images), key=lambda x: get_timestamp(x[1]))
     indices, images = zip(*imgs_with_indices)
     indices = np.array(indices)
     index2sorted = {index: i for i, index in enumerate(indices)}

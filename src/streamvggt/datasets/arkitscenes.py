@@ -4,7 +4,12 @@ import os.path as osp
 import cv2
 import numpy as np
 
-from .base.base_multiview_dataset import BaseMultiViewDataset
+from .base.base_multiview_dataset import (
+    BaseMultiViewDataset,
+    EmptyDatasetError,
+    intrinsics_rows_to_K,
+    validate_max_interval,
+)
 from .types import Split
 from .utils.image import imread_cv2
 
@@ -54,16 +59,17 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         ROOT,
         max_interval=DEFAULT_MAX_INTERVAL,
         is_metric=True,
+        highres_root=None,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        if not isinstance(max_interval, int) or max_interval < 1:
-            raise ValueError(
-                f"ARKitScenes max_interval must be a positive int, got {max_interval!r}"
-            )
-        self.max_interval = max_interval
+        # explicit root of the highres sibling tree whose scenes this loader
+        # must exclude; None falls back to the original DUSt3R convention of
+        # deriving ROOT + "_highres" (silently skipped when absent)
+        self.highres_root = highres_root
+        self.max_interval = validate_max_interval(max_interval, "ARKitScenes")
         super().__init__(*args, **kwargs)
         match self.split:
             case Split.TRAIN:
@@ -82,12 +88,30 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         with np.load(osp.join(self.ROOT, split, "all_metadata.npz")) as data:
             self.scenes: np.ndarray = data["scenes"]
             high_res_list = np.array([])
-            highres_root = os.path.join(
-                self.ROOT.rstrip("/") + "_highres",
-                "Training" if split == Split.TRAIN else "Validation",
-            )
-            if os.path.isdir(highres_root):
-                high_res_list = np.array([d for d in os.listdir(highres_root)])
+            # the highres tree uses Training/Validation (not Training/Test),
+            # so resolve its subdir from the Split enum instead of reusing the
+            # lowres directory name in `split`
+            highres_dir = "Training" if self.split == Split.TRAIN else "Validation"
+            if self.highres_root is not None:
+                # explicit exclusion root (from the config, which knows the
+                # real highres path): must exist -- a typo here would silently
+                # double-count the highres scenes in both variants
+                highres_split_dir = os.path.join(str(self.highres_root), highres_dir)
+                if not os.path.isdir(highres_split_dir):
+                    raise FileNotFoundError(
+                        f"ARKitScenes highres_root was given explicitly but "
+                        f"{highres_split_dir} does not exist"
+                    )
+                high_res_list = np.array(os.listdir(highres_split_dir))
+            else:
+                # original DUSt3R convention: sibling tree named ROOT_highres;
+                # silently skipped when absent (lowres-only setups)
+                highres_split_dir = os.path.join(
+                    self.ROOT.rstrip("/") + "_highres",
+                    highres_dir,
+                )
+                if os.path.isdir(highres_split_dir):
+                    high_res_list = np.array(os.listdir(highres_split_dir))
 
             self.scenes = np.setdiff1d(self.scenes, high_res_list)
         offset = 0
@@ -108,11 +132,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                 imgs = data["images"]
                 intrins = data["intrinsics"]
                 traj = data["trajectories"]
-                min_seq_len = (
-                    self.num_views
-                    if not self.allow_repeat
-                    else max(self.num_views // 3, 3)
-                )
+                min_seq_len = self.min_views()
                 if len(imgs) < min_seq_len:
                     print(f"Skipping {scene}")
                     continue
@@ -127,11 +147,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
 
                 num_imgs = imgs.shape[0]
                 img_groups = []
-                min_group_len = (
-                    self.num_views
-                    if not self.allow_repeat
-                    else max(self.num_views // 3, 3)
-                )
+                min_group_len = self.min_views()
                 for ref_id, group in collections["image"].item().items():
                     if len(group) + 1 < min_group_len:
                         continue
@@ -149,13 +165,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                 sceneids.extend([j] * num_imgs)
                 id_ranges.extend([(offset, offset + num_imgs) for _ in range(num_imgs)])
                 images.extend(imgs)
-                K = np.expand_dims(np.eye(3), 0).repeat(num_imgs, 0)
-
-                K[:, 0, 0] = [fx for _, _, fx, _, _, _ in intrins]
-                K[:, 1, 1] = [fy for _, _, _, fy, _, _ in intrins]
-                K[:, 0, 2] = [cx for _, _, _, _, cx, _ in intrins]
-                K[:, 1, 2] = [cy for _, _, _, _, _, cy in intrins]
-                intrinsics.extend(list(K))
+                intrinsics.extend(list(intrinsics_rows_to_K(intrins)))
                 trajectories.extend(list(traj))
 
                 # offset groups
@@ -164,6 +174,10 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                 offset += num_imgs
                 j += 1
 
+        if not scenes:
+            raise EmptyDatasetError(
+                f"ARKitScenes found no usable scenes under {osp.join(self.ROOT, split)}"
+            )
         self.scenes = scenes
         self.sceneids = sceneids
         self.id_ranges = id_ranges

@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .base.base_multiview_dataset import BaseMultiViewDataset
+from .base.base_multiview_dataset import BaseMultiViewDataset, EmptyDatasetError
 from .types import Split
 from .utils.image import imread_cv2
 
@@ -98,6 +98,10 @@ class ScanNet_Multi(BaseMultiViewDataset):
                 offset += num_imgs
                 j += 1
 
+        if not scenes:
+            raise EmptyDatasetError(
+                f"ScanNet found no usable scenes under {self.scene_root}"
+            )
         self.scenes = scenes
         self.sceneids = sceneids
         self.images = images
