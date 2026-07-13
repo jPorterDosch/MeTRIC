@@ -13,14 +13,15 @@ import math
 import os
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from collections.abc import Callable
 from pathlib import Path
-from typing import Sized
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
 
 from streamvggt.loss import LossConfig
 from dust3r.inference import loss_of_one_batch  # noqa
@@ -49,6 +50,7 @@ from streamvggt.depth_cond import (
     seed_everything,
     simulate_sparse_depth,
 )
+from eval.temporal_consistency.metrics import depth_evaluation, tae
 from finetune import save_current_code, setup_for_distributed  # reuse
 from streamvggt.datasets import (
     CatDataset,
@@ -120,7 +122,7 @@ class FinetuneDepthCfg:
     # mixture); build with dataset.build_all() and concatenate -- no eval.
     # The default reproduces the original recipe's ARKitScenes slice:
     # 4500 @ lowres + 2250 @ highres (the loaders partition the scenes).
-    dataset: MultiDatasetConfig = field(
+    train_dataset: MultiDatasetConfig = field(
         default_factory=lambda: MultiDatasetConfig(
             root=(
                 Path("../data/train/processed_arkitscenes/"),
@@ -147,6 +149,27 @@ class FinetuneDepthCfg:
             n_corres=0,
         )
     )
+
+    # The default mirrors the original recipe's test slice:
+    # 1000 @ ARKitScenes lowres, split test, single (518, 392) resolution,
+    # num_views 4, seed 42 (per-__getitem__ reseed -> deterministic clips).
+    # Note Split.VAL does not exist -- the dataset classes only accept
+    # TRAIN/TEST (highres maps TEST to its Validation/ tree on disk).
+    val_dataset: MultiDatasetConfig = field(
+        default_factory=lambda: MultiDatasetConfig(
+            root=(Path("../data/train/processed_arkitscenes/"),),
+            dataset=(DatasetName.ARKITSCENES_LOWRES,),
+            max_interval=(8,),
+            epoch_size=(1000,),
+            highres_root=(Path("../data/train/processed_arkitscenes_highres/"),),
+            num_views=4,
+            resolution=((518, 392),),
+            split=Split.TEST,
+            n_corres=0,
+            seed=42,
+        )
+    )
+
     num_workers: int = 12
     fixed_length: bool = True
     benchmark: bool = False
@@ -157,6 +180,9 @@ class FinetuneDepthCfg:
     # pass --loss.recipe finetune_train for the historical
     #   ConfLoss(Regr3DPose(L21, norm_mode='?avg_dis'), alpha=0.2) + FinetuneLoss()
     loss: LossConfig = field(default_factory=LossConfig)
+
+    # Validation configuration
+    val_freq: int = 1
 
     # logging / saving cadence (not part of the experiment identity)
     print_freq: int = 10
@@ -190,26 +216,53 @@ def build_manifest(cfg: FinetuneDepthCfg) -> dict:
 
 
 def build_train_loader(
-    args: FinetuneDepthCfg, accelerator
+    args: FinetuneDepthCfg, split: Split, accelerator
 ) -> torch.utils.data.DataLoader:
-    """Build the training mixture (one CatDataset over every configured
+    """Build the dataset mixture (one CatDataset over every configured
     dataset, mirroring the original `N @ ds1 + M @ ds2` recipes) and wrap it
     in the batched-sampler loader.
     """
-    printer.info("Building train datasets %s", args.dataset)
-    train_datasets = args.dataset.build_all()
-    train_dataset = (
-        train_datasets[0] if len(train_datasets) == 1 else CatDataset(train_datasets)
-    )
-    return get_data_loader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        drop_last=True,
-        accelerator=accelerator,
-        fixed_length=args.fixed_length,
-    )
+    match split:
+        case Split.TRAIN:
+            printer.info("Building train datasets %s", args.train_dataset)
+            train_datasets = args.train_dataset.build_all()
+            train_dataset = (
+                train_datasets[0]
+                if len(train_datasets) == 1
+                else CatDataset(train_datasets)
+            )
+            return get_data_loader(
+                train_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=True,
+                drop_last=True,
+                accelerator=accelerator,
+                fixed_length=args.fixed_length,
+            )
+        case Split.TEST:
+            printer.info("Building validation datasets %s", args.val_dataset)
+            val_datasets = args.val_dataset.build_all()
+            val_dataset = (
+                val_datasets[0] if len(val_datasets) == 1 else CatDataset(val_datasets)
+            )
+            # shuffle=True is still deterministic here: every draw in
+            # CustomRandomSampler comes from a rng seeded by the epoch number
+            # (epoch + 788), and ResizedDataset's 1000-slot mapping from
+            # epoch + 777 -- val_loop pins both with set_epoch(0) each pass.
+            # (make_sampler raises NotImplementedError on shuffle=False.)
+            return get_data_loader(
+                val_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=True,
+                drop_last=False,
+                accelerator=accelerator,
+                fixed_length=args.fixed_length,
+            )
+
+        case _:
+            raise ValueError(f"Expected split in {list(Split)}, got: {split}.")
 
 
 def build_model(
@@ -287,7 +340,10 @@ def run(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
-    data_loader_train = build_train_loader(args, accelerator)
+    data_loader_train = build_train_loader(args, Split.TRAIN, accelerator)
+    data_loader_val = (
+        build_train_loader(args, Split.TEST, accelerator) if args.val_freq > 0 else None
+    )
 
     printer.info("Loading depth-conditioned model")
     model, _ = build_model(args, mcfg, device)
@@ -309,6 +365,8 @@ def run(
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
+    if data_loader_val is not None:
+        data_loader_val = accelerator.prepare(data_loader_val)
 
     def save_model(
         epoch: int, fname: str, best_so_far: float, data_iter_step: int
@@ -341,7 +399,7 @@ def run(
         if epoch >= args.epochs:
             break
 
-        train_one_epoch(
+        train_loop(
             model,
             train_criterion,
             data_loader_train,
@@ -354,10 +412,44 @@ def run(
             save_model=save_model,
         )
 
+        # the loop breaks at `epoch >= args.epochs` before training, so the
+        # last epoch that reaches this point is args.epochs - 1
+        is_last_epoch = epoch == args.epochs - 1
+        if data_loader_val is not None and (
+            epoch % args.val_freq == 0 or is_last_epoch
+        ):
+            val_stats = val_loop(
+                model,
+                train_criterion,
+                data_loader_val,
+                accelerator,
+                epoch,
+                # training already logged up to (epoch+1)*len this epoch, and
+                # wandb drops rows whose step is below the current max
+                step=(epoch + 1) * len(data_loader_train),
+                args=args,
+                mcfg=mcfg,
+            )
+            if val_stats["loss_med"] < best_so_far:
+                best_so_far = val_stats["loss_med"]
+                save_model(epoch, "best", best_so_far, args.start_step)
+
     total_time = time.time() - start_time
     printer.info(
         "Training time {}".format(str(datetime.timedelta(seconds=int(total_time))))
     )
+
+    # final causal evaluation on the deployment (per-frame KV-cache) path;
+    # must run before the final save below moves the model to cpu
+    if data_loader_val is not None:
+        streaming_eval(
+            model,
+            data_loader_val,
+            accelerator,
+            step=args.epochs * len(data_loader_train),
+            args=args,
+            mcfg=mcfg,
+        )
 
     output_dir = Path(args.output_dir)
     to_save = {
@@ -370,10 +462,27 @@ def run(
     accelerator.end_training()
 
 
-def train_one_epoch(
+def _prepare_batch(batch: list[dict], mcfg: MetricCfg) -> None:
+    """Shared train/val batch preprocessing, in this order: rescale imgs to
+    [0, 1], then attach the sparse-depth conditioning input (patch-masked
+    samples of the GT depth)."""
+    if isinstance(batch, list) and all(
+        isinstance(v, dict) and "img" in v for v in batch
+    ):
+        for view in batch:
+            view["img"] = (view["img"] + 1.0) / 2.0
+    simulate_sparse_depth(
+        batch,
+        mode=mcfg.depth_cond.sim_mode,
+        patch_size=mcfg.depth_cond.sim_patch_size,
+        mask_ratio=mcfg.depth_cond.sim_mask_ratio,
+    )
+
+
+def train_loop(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
-    data_loader: Sized,
+    data_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     accelerator: Accelerator,
     epoch: int,
@@ -407,19 +516,7 @@ def train_one_epoch(
         metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
     ):
         with accelerator.accumulate(model):
-            if isinstance(batch, list) and all(
-                isinstance(v, dict) and "img" in v for v in batch
-            ):
-                for view in batch:
-                    view["img"] = (view["img"] + 1.0) / 2.0
-
-            # depth conditioning input: patch-masked samples of the GT depth
-            simulate_sparse_depth(
-                batch,
-                mode=mcfg.depth_cond.sim_mode,
-                patch_size=mcfg.depth_cond.sim_patch_size,
-                mask_ratio=mcfg.depth_cond.sim_mask_ratio,
-            )
+            _prepare_batch(batch, mcfg)
 
             epoch_f = epoch + data_iter_step / len(data_loader)
             if data_iter_step % accum_iter == 0:
@@ -496,6 +593,283 @@ def train_one_epoch(
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def _stack_depth_batch(
+    views: list[dict], preds: list[dict]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """views/preds are the [S]-lists loss_of_one_batch returns as
+    result["views"]/result["pred"] -- the training forward and the streaming
+    inference path emit the same per-view shapes. Real GT is g["depthmap"]
+    (NOT g["depth"], the teacher output); p["depth"] is the prediction.
+    Returns (pred, gt, valid, K, pose), all [B,S,...] on cpu."""
+    pred = torch.stack([p["depth"].detach() for p in preds], dim=1)
+    pred = pred.squeeze(-1).float().cpu()  # [B,S,H,W,1] -> [B,S,H,W]
+    gt = torch.stack([g["depthmap"] for g in views], dim=1).float().cpu()
+    valid = torch.stack([g["valid_mask"] for g in views], dim=1).cpu().bool()
+    K = torch.stack([g["camera_intrinsics"] for g in views], dim=1).float().cpu()
+    pose = torch.stack([g["camera_pose"] for g in views], dim=1).float().cpu()
+    return pred, gt, valid, K, pose
+
+
+def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
+    """Matrix mapping homogeneous pixel coords (u*z, v*z, z, 1) to world, the
+    convention metrics.tae expects: inv(K_4x4 @ world2cam) = cam2world @
+    inv(K_4x4). K [3,3], pose [4,4] cam2world."""
+    k4 = np.eye(4)
+    k4[:3, :3] = K.numpy()
+    return pose.numpy().astype(np.float64) @ np.linalg.inv(k4)
+
+
+def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]:
+    """Sequence-level depth metrics for one batch: affine-invariant (one lstsq
+    scale/shift over the whole clip) and metric (no-alignment) AbsRel /
+    delta<1.25, plus TAE over adjacent frames of the ALIGNED prediction. The
+    whole-clip alignment is non-causal -- fine for the training-forward val
+    pass; the streaming eval uses _streaming_depth_metrics instead."""
+    pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
+
+    out: dict[str, list[float]] = {}
+    B, S, H, W = gt.shape
+    for b in range(B):
+        mask = valid[b] & (gt[b] > 0)  # [S,H,W]
+        if not mask.any():
+            continue
+        # the 3rd return is the aligned full-size prediction, reused for TAE.
+        # enable_grad: the eval loops run under no_grad, but the s/t alignment
+        # (absolute_value_scaling2) optimizes with Adam and needs autograd
+        with torch.enable_grad():
+            res_affine, _, aligned, _ = depth_evaluation(
+                pred[b], gt[b], custom_mask=mask, scale_and_shift=True
+            )
+        aligned = aligned.detach()
+        # affine-variant: raw prediction vs GT, measures metric alignment
+        res_metric, _, _, _ = depth_evaluation(
+            pred[b], gt[b], custom_mask=mask, metric_scale=True
+        )
+        out.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
+        out.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
+        out.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
+        out.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+
+        aligned = torch.as_tensor(aligned).reshape(S, H, W).numpy()
+        mask_np = mask.numpy()
+        i2l = [_img2lidar(K[b, i], pose[b, i]) for i in range(S)]
+        errs = [
+            tae(
+                aligned[i],
+                mask_np[i],
+                i2l[i],
+                aligned[i + 1],
+                mask_np[i + 1],
+                i2l[i + 1],
+            )
+            for i in range(S - 1)
+        ]
+        errs = [e for e in errs if np.isfinite(e)]
+        if errs:
+            out.setdefault("tae", []).append(float(np.mean(errs)))
+    return {k: float(np.mean(v)) for k, v in out.items()}
+
+
+def _streaming_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]:
+    """Causal variant for the streaming eval: no metric sees a future frame.
+    AbsRel / delta<1.25 are per-frame (metric = raw pred; affine = per-frame
+    lstsq), and TAE compares consecutive RAW predictions -- only the prior
+    frame is retained, mirroring deployment, and no alignment jitter leaks in."""
+    pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
+
+    out: dict[str, list[float]] = {}
+    B, S, H, W = gt.shape
+    for b in range(B):
+        frame_stats: dict[str, list[float]] = {}
+        errs: list[float] = []
+        prev: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        for i in range(S):
+            mask = valid[b, i] & (gt[b, i] > 0)  # [H,W]
+            if not mask.any():
+                continue
+            # enable_grad: the s/t alignment inside needs autograd (see
+            # _val_depth_metrics)
+            with torch.enable_grad():
+                res_affine, _, _, _ = depth_evaluation(
+                    pred[b, i], gt[b, i], custom_mask=mask, scale_and_shift=True
+                )
+            res_metric, _, _, _ = depth_evaluation(
+                pred[b, i], gt[b, i], custom_mask=mask, metric_scale=True
+            )
+            frame_stats.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
+            frame_stats.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
+            frame_stats.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
+            frame_stats.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+
+            cur = (
+                pred[b, i].numpy(),
+                mask.numpy(),
+                _img2lidar(K[b, i], pose[b, i]),
+            )
+            if prev is not None:
+                err = tae(*prev, *cur)
+                if np.isfinite(err):
+                    errs.append(err)
+            prev = cur
+        for k, v in frame_stats.items():
+            out.setdefault(k, []).append(float(np.mean(v)))
+        if errs:
+            out.setdefault("tae", []).append(float(np.mean(errs)))
+    return {k: float(np.mean(v)) for k, v in out.items()}
+
+
+def _log_val_stats(
+    metric_logger: misc.MetricLogger,
+    accelerator: Accelerator,
+    prefix: str,
+    step: int,
+) -> dict:
+    """Whole-epoch avg/med aggregation + wandb logging, ported from
+    finetune.py::test_one_epoch."""
+    metric_logger.synchronize_between_processes(accelerator)
+    printer.info("Averaged stats: %s", metric_logger)
+
+    aggs = [("avg", "global_avg"), ("med", "median")]
+    results = {
+        f"{name}_{tag}": getattr(meter, attr)
+        for name, meter in metric_logger.meters.items()
+        for tag, attr in aggs
+    }
+    log_dict = {}
+    for name, val in results.items():
+        if isinstance(val, torch.Tensor) and val.ndim > 0:
+            continue
+        if isinstance(val, dict):
+            continue
+        log_dict[prefix + "_" + name] = val
+    accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
+    return results
+
+
+def _pin_val_data(data_loader: DataLoader) -> None:
+    """Pin the loader to epoch 0 so every val pass sees the identical clip set
+    and order: the sampler seeds its rng from epoch + 788 and ResizedDataset
+    its slot mapping from epoch + 777 -- the epoch number is their only
+    entropy. Same duck-typed plumbing as train_loop."""
+    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
+        data_loader.dataset.set_epoch(0)
+    if (
+        hasattr(data_loader, "batch_sampler")
+        and hasattr(data_loader.batch_sampler, "batch_sampler")
+        and hasattr(data_loader.batch_sampler.batch_sampler, "set_epoch")
+    ):
+        data_loader.batch_sampler.batch_sampler.set_epoch(0)
+
+
+@torch.no_grad()
+def val_loop(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: DataLoader,
+    accelerator: Accelerator,
+    epoch: int,
+    step: int,
+    args: FinetuneDepthCfg,
+    mcfg: MetricCfg,
+    prefix: str = "val",
+) -> dict:
+    """Validation on the training forward path: loss_of_one_batch with
+    inference=False gives the criterion loss AND the predictions for the depth
+    metrics in a single pass. Mirrors finetune.py::test_one_epoch."""
+    if not torch.backends.cuda.matmul.allow_tf32:
+        raise RuntimeError("TF32 matmul must stay enabled (set at module import)")
+
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
+    header = "Val Epoch: [{}]".format(epoch)
+    _pin_val_data(data_loader)
+
+    # fork + fix the torch RNG: the sparse-conditioning masks (torch.rand) and
+    # query-point sampling are identical every epoch, and the training RNG
+    # stream is restored on exit
+    devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(args.seed)
+        if devices:
+            torch.cuda.manual_seed_all(args.seed)
+        for _, batch in enumerate(
+            metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
+        ):
+            _prepare_batch(batch, mcfg)
+            result = loss_of_one_batch(
+                batch,
+                model,
+                criterion,
+                accelerator,
+                inference=False,
+                symmetrize_batch=False,
+                use_amp=bool(args.amp),
+            )
+            loss_value, loss_details = result["loss"]
+            depth_stats = _val_depth_metrics(result["views"], result["pred"])
+            metric_logger.update(loss=float(loss_value), **loss_details, **depth_stats)
+            del result, batch
+
+    results = _log_val_stats(metric_logger, accelerator, prefix, step)
+    model.train(True)
+    return results
+
+
+@torch.no_grad()
+def streaming_eval(
+    model: torch.nn.Module,
+    data_loader: DataLoader,
+    accelerator: Accelerator,
+    step: int,
+    args: FinetuneDepthCfg,
+    mcfg: MetricCfg,
+    prefix: str = "final_stream",
+) -> dict:
+    """One-shot post-training eval on the per-frame KV-cache path
+    (MetricStreamVGGT.inference), with causal metrics only. The inference
+    branch of loss_of_one_batch returns dict(views, pred) with no loss key,
+    so no criterion runs here. Keys are namespaced by the prefix, keeping
+    them apart from the non-causal val_* series."""
+    if args.batch_size != 1:
+        raise ValueError(
+            "streaming_eval requires batch_size=1: StreamVGGT.inference "
+            "treats the batch dim of frame['img'] as extra frames"
+        )
+
+    model.eval()
+    net = accelerator.unwrap_model(model)  # the DDP wrapper has no .inference
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
+    header = "Streaming eval:"
+    _pin_val_data(data_loader)
+
+    devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(args.seed)
+        if devices:
+            torch.cuda.manual_seed_all(args.seed)
+        for _, batch in enumerate(
+            metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
+        ):
+            _prepare_batch(batch, mcfg)
+            result = loss_of_one_batch(
+                batch,
+                net,
+                None,
+                accelerator,
+                inference=True,
+                symmetrize_batch=False,
+                use_amp=bool(args.amp),
+            )
+            metric_logger.update(
+                **_streaming_depth_metrics(result["views"], result["pred"])
+            )
+            del result, batch
+
+    return _log_val_stats(metric_logger, accelerator, prefix, step)
 
 
 def main(cfg: FinetuneDepthCfg) -> None:
