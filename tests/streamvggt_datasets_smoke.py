@@ -16,7 +16,9 @@ Checks, in order:
      the loss/conditioning code touches exists with the right dtype/shape,
      img in [-1, 1], float32 finite depth, finite cam2world pose, ray_map, ...;
   6. no silent overwrite: max_interval / is_metric passed via the config are the
-     values the constructed dataset actually uses.
+     values the constructed dataset actually uses;
+  7. multi-dataset config: parallel-tuple fan-out puts entry i of every tuple
+     into DatasetConfig i, and any tuple-length mismatch fails fast.
 
 Run: python tests/streamvggt_datasets_smoke.py [DATA_DIR]
 (default DATA_DIR: ~/scratch/data)
@@ -36,6 +38,8 @@ import streamvggt.datasets as D  # noqa: E402
 from streamvggt.datasets import (  # noqa: E402
     DatasetConfig,
     DatasetName,
+    EmptyDatasetError,
+    MultiDatasetConfig,
     Split,
     TransformName,
 )
@@ -60,7 +64,8 @@ REQUIRED_VIEW_KEYS = [
 # (DatasetName, sub-path under DATA_DIR, canonical max_interval)
 DATA_CASES = [
     (DatasetName.HAMMER, "processed_hammer", 20),
-    (DatasetName.ARKITSCENES, "processed_arkitscenes", 8),
+    (DatasetName.ARKITSCENES_LOWRES, "processed_arkitscenes", 8),
+    (DatasetName.ARKITSCENES_HIGHRES, "processed_arkitscenes_highres", 8),
     (DatasetName.SCANNET, "processed_scannet", 30),
 ]
 
@@ -90,8 +95,12 @@ def check_registration():
     for name in (
         "HAMMER_Multi",
         "ARKitScenes_Multi",
+        "ARKitScenesHighRes_Multi",
         "ScanNet_Multi",
+        "CatDataset",
         "DatasetConfig",
+        "EmptyDatasetError",
+        "MultiDatasetConfig",
         "DatasetName",
         "Split",
         "TransformName",
@@ -100,7 +109,12 @@ def check_registration():
         "BatchedRandomSampler",
     ):
         assert hasattr(D, name), f"missing export: {name}"
-    assert {d.value for d in DatasetName} == {"hammer", "arkitscenes", "scannet"}
+    assert {d.value for d in DatasetName} == {
+        "hammer",
+        "arkitscenes_lowres",
+        "arkitscenes_highres",
+        "scannet",
+    }
     print("  [2] registration + exports; DatasetName covers the built datasets")
 
 
@@ -167,7 +181,7 @@ def check_enum_and_cli():
         "--root",
         ROOT,
         "--dataset",
-        "ARKITSCENES",
+        "ARKITSCENES_LOWRES",
         "--num-views",
         "6",
         "--max-interval",
@@ -184,12 +198,104 @@ def check_enum_and_cli():
         "--no-is-metric",
     ]
     parsed = tyro.cli(DatasetConfig, args=argv)
-    assert parsed.dataset is DatasetName.ARKITSCENES
+    assert parsed.dataset is DatasetName.ARKITSCENES_LOWRES
     assert parsed.num_views == 6 and parsed.max_interval == 11
     assert parsed.resolution == ((512, 384), (256, 256))
     assert parsed.split is Split.TEST and parsed.is_metric is False
     assert parsed.transform is TransformName.SEQ_COLOR_JITTER
     print("  [4] enum string coercion + tyro CLI parse into the expected config")
+
+
+def check_multi_config():
+    # fan-out: entry i of every parallel tuple lands in DatasetConfig i,
+    # shared fields are replicated, and enum strings coerce on validate()
+    mc = MultiDatasetConfig(
+        root=(Path(ROOT), Path(ROOT)),
+        dataset=("arkitscenes_lowres", "arkitscenes_highres"),
+        max_interval=(8, 12),
+        epoch_size=(100, 50),
+        num_views=4,
+        resolution=((518, 518),),
+        transform="seq_color_jitter",
+    )
+    cfgs = mc.to_dataset_configs()
+    assert [c.dataset for c in cfgs] == [
+        DatasetName.ARKITSCENES_LOWRES,
+        DatasetName.ARKITSCENES_HIGHRES,
+    ]
+    assert [c.max_interval for c in cfgs] == [8, 12]
+    assert [c.epoch_size for c in cfgs] == [100, 50]
+    assert all(c.num_views == 4 and c.is_metric is True for c in cfgs)
+    assert all(c.transform is TransformName.SEQ_COLOR_JITTER for c in cfgs)
+
+    # omitted per-dataset optionals: natural length, metric for all
+    mc_min = MultiDatasetConfig(
+        root=(Path(ROOT),),
+        dataset=(DatasetName.HAMMER,),
+        max_interval=(20,),
+        num_views=4,
+        resolution=((518, 518),),
+    )
+    (cfg,) = mc_min.to_dataset_configs()
+    assert cfg.epoch_size is None and cfg.is_metric is True
+
+    # fail-fast: any parallel-tuple length mismatch raises before any build
+    for bad in (
+        dict(dataset=(DatasetName.HAMMER,)),
+        dict(max_interval=(8,)),
+        dict(epoch_size=(100,)),
+        dict(is_metric=(True,)),
+    ):
+        kwargs = dict(
+            root=(Path(ROOT), Path(ROOT)),
+            dataset=(DatasetName.HAMMER, DatasetName.SCANNET),
+            max_interval=(20, 30),
+            num_views=4,
+            resolution=((518, 518),),
+        )
+        kwargs.update(bad)
+        try:
+            MultiDatasetConfig(**kwargs).validate()
+            raise AssertionError(f"length mismatch did not raise: {bad}")
+        except ValueError:
+            pass
+    # zero datasets raises
+    try:
+        MultiDatasetConfig(
+            root=(),
+            dataset=(),
+            max_interval=(),
+            num_views=4,
+            resolution=((518, 518),),
+        ).validate()
+        raise AssertionError("empty MultiDatasetConfig did not raise")
+    except ValueError:
+        pass
+
+    # drift guard: a DatasetConfig knob the fan-out does not pass must raise,
+    # not silently take DatasetConfig's default for every dataset
+    import dataclasses as dc
+
+    import streamvggt.datasets.config as cfg_mod
+
+    extended = dc.make_dataclass(
+        "DatasetConfigWithNewKnob",
+        [("new_knob", int, dc.field(default=0))],
+        bases=(DatasetConfig,),
+    )
+    original = cfg_mod.DatasetConfig
+    cfg_mod.DatasetConfig = extended
+    try:
+        mc_min.to_dataset_configs()
+        raise AssertionError("unmapped DatasetConfig field did not raise")
+    except TypeError as e:
+        assert "new_knob" in str(e), f"guard did not name the field: {e}"
+    finally:
+        cfg_mod.DatasetConfig = original
+    print(
+        "  [7] multi-dataset config: fan-out correct, length mismatches raise, "
+        "unmapped-knob drift guard fires"
+    )
 
 
 def check_view_contract(data_dir):
@@ -208,7 +314,13 @@ def check_view_contract(data_dir):
             split=Split.TRAIN,
             seed=42,
         )
-        ds = cfg.build()
+        try:
+            ds = cfg.build()
+        except EmptyDatasetError as e:
+            # stub / partially-downloaded tree: data-dependent skip, caught
+            # by type (the shared empty-dataset contract), not message text
+            print(f"  [5] {dsname.name}: SKIP ({e})")
+            continue
         # no silent overwrite
         assert ds.max_interval == max_interval and ds.is_metric is True
         views = ds[0]
@@ -238,6 +350,7 @@ def main():
     check_registration()
     check_fail_fast()
     check_enum_and_cli()
+    check_multi_config()
     ran = check_view_contract(data_dir)
     if ran == 0:
         print("\nPASSED (data-free checks; no dataset ROOTs found to exercise views)")
