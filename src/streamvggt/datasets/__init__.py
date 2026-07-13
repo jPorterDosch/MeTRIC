@@ -10,8 +10,9 @@ config), and :mod:`streamvggt.datasets.types` for the ``Split`` / ``DatasetName`
 """
 
 from .arkitscenes import ARKitScenes_Multi
+from .arkitscenes_highres import ARKitScenesHighRes_Multi
 from .base.batched_sampler import BatchedRandomSampler
-from .config import DatasetConfig, build_dataset
+from .config import DatasetConfig, MultiDatasetConfig, build_dataset
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
 from .scannet import ScanNet_Multi
@@ -21,10 +22,12 @@ import torch
 
 __all__ = [
     "ARKitScenes_Multi",
+    "ARKitScenesHighRes_Multi",
     "HAMMER_Multi",
     "ScanNet_Multi",
     "BatchedRandomSampler",
     "DatasetConfig",
+    "MultiDatasetConfig",
     "build_dataset",
     "DatasetName",
     "Split",

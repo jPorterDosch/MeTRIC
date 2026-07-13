@@ -82,9 +82,13 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         with np.load(osp.join(self.ROOT, split, "all_metadata.npz")) as data:
             self.scenes: np.ndarray = data["scenes"]
             high_res_list = np.array([])
+            # the highres tree uses Training/Validation (not Training/Test),
+            # so resolve its subdir from the Split enum instead of reusing the
+            # lowres directory name in `split`
+            highres_dir = "Training" if self.split == Split.TRAIN else "Validation"
             highres_root = os.path.join(
                 self.ROOT.rstrip("/") + "_highres",
-                "Training" if split == Split.TRAIN else "Validation",
+                highres_dir,
             )
             if os.path.isdir(highres_root):
                 high_res_list = np.array([d for d in os.listdir(highres_root)])

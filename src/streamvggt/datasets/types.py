@@ -17,7 +17,13 @@ class Split(str, enum.Enum):
 
 class DatasetName(str, enum.Enum):
     HAMMER = "hammer"
-    ARKITSCENES = "arkitscenes"
+    # ARKitScenes ships as two disjoint variants that partition the scenes:
+    # LOWRES = LiDAR depth + pairs-based sampling (new_scene_metadata.npz),
+    # HIGHRES = laser-scanner GT depth + timestamp sampling (scene_metadata.npz).
+    # There is deliberately no bare "arkitscenes" member: selecting a variant
+    # is part of the experiment identity, so it must be explicit.
+    ARKITSCENES_LOWRES = "arkitscenes_lowres"
+    ARKITSCENES_HIGHRES = "arkitscenes_highres"
     SCANNET = "scannet"
 
 
