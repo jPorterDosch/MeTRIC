@@ -1,6 +1,7 @@
+from functools import lru_cache
+
 import numpy as np
 import torch
-from scipy.optimize import minimize
 
 """
 This file contains evaluation metrics for the validation passes of the model.
@@ -14,15 +15,27 @@ def abs_rel(gt: np.ndarray, pred: np.ndarray) -> float:
     return abs_rel
 
 
+@lru_cache(maxsize=8)
+def _pixel_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+    # Integer pixel coordinates: this matches the unprojection convention the
+    # dataset intrinsics assume (np.arange grids in streamvggt/utils/geometry
+    # and dust3r/utils/geometry). Half-pixel centers put reprojected
+    # coordinates exactly at .5, where np.round (half-to-even) misregisters
+    # ~half the pixels, giving TAE a false noise floor for perfect static
+    # predictions.
+    ys, xs = np.meshgrid(
+        np.arange(h, dtype=np.float32),
+        np.arange(w, dtype=np.float32),
+        indexing="ij",
+    )
+    return ys, xs
+
+
 def depth2point(
     depth: np.ndarray, mask: np.ndarray, img2lidar: np.ndarray
 ) -> np.ndarray:
     h, w = depth.shape
-    ys, xs = np.meshgrid(
-        np.linspace(0.5, h - 0.5, h),
-        np.linspace(0.5, w - 0.5, w),
-        indexing="ij",
-    )
+    ys, xs = _pixel_grid(h, w)
     # (H, W, 4)
     points = np.stack([xs, ys, depth, np.ones_like(xs)], axis=-1)
     points = points[mask]
@@ -58,58 +71,24 @@ def point2depth(
     return warp_depth
 
 
-def absolute_value_scaling2(
-    predicted_depth: np.ndarray,
-    ground_truth_depth: np.ndarray,
-    s_init: float = 1.0,
-    t_init: float = 0.0,
-    lr: float = 1e-4,
-    max_iters: int = 1000,
-    tol: float = 1e-6,
-) -> float:
-    # Initialize s and t as torch tensors with requires_grad=True
-    s = torch.tensor(
-        [s_init],
-        requires_grad=True,
-        device=predicted_depth.device,
-        dtype=predicted_depth.dtype,
-    )
-    t = torch.tensor(
-        [t_init],
-        requires_grad=True,
-        device=predicted_depth.device,
-        dtype=predicted_depth.dtype,
-    )
-
-    optimizer = torch.optim.Adam([s, t], lr=lr)
-
-    prev_loss = None
-
-    for i in range(max_iters):
-        optimizer.zero_grad()
-
-        # Compute predicted aligned depth
-        predicted_aligned = s * predicted_depth + t
-
-        # Compute absolute error
-        abs_error = torch.abs(predicted_aligned - ground_truth_depth)
-
-        # Compute loss
-        loss = torch.sum(abs_error)
-
-        # Backpropagate
-        loss.backward()
-
-        # Update parameters
-        optimizer.step()
-
-        # Check convergence
-        if prev_loss is not None and torch.abs(prev_loss - loss) < tol:
-            break
-
-        prev_loss = loss.item()
-
-    return s.detach().item(), t.detach().item()
+def closed_form_scale_and_shift(
+    predicted_depth: torch.Tensor, ground_truth_depth: torch.Tensor
+) -> tuple[float, float]:
+    """Exact least-squares (s, t) minimizing ||s * pred + t - gt||^2 over the
+    already-masked 1-D tensors, via the 2x2 normal equations (a few BLAS
+    reductions; float64 for the accumulations). Replaces a 1000-step Adam L1
+    alignment that cost ~60 s per clip on CPU and returned non-converged s/t."""
+    p = predicted_depth.reshape(-1).double()
+    g = ground_truth_depth.reshape(-1).double()
+    n = float(p.numel())
+    sp, sg = p.sum(), g.sum()
+    spp, spg = p @ p, p @ g
+    det = spp * n - sp * sp
+    if det.abs() < 1e-12:  # constant prediction: scale is unidentifiable
+        return 1.0, ((sg - sp) / n).item()
+    s = (spg * n - sp * sg) / det
+    t = (spp * sg - sp * spg) / det
+    return s.item(), t.item()
 
 
 def tae(
@@ -133,19 +112,6 @@ def tae(
     return 0.5 * (error_a2b + error_b2a)
 
 
-def absolute_error_loss(
-    params: tuple[float, float],
-    predicted_depth: np.ndarray,
-    ground_truth_depth: np.ndarray,
-) -> float:
-    s, t = params
-
-    predicted_aligned = s * predicted_depth + t
-
-    abs_error = np.abs(predicted_aligned - ground_truth_depth)
-    return np.sum(abs_error)
-
-
 def depth2disparity(depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if isinstance(depth, torch.Tensor):
         disparity = np.zeros_like(depth.detach().cpu().numpy())
@@ -155,27 +121,6 @@ def depth2disparity(depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     disparity[non_negative_mask] = 1.0 / depth[non_negative_mask]
 
     return disparity, non_negative_mask
-
-
-def absolute_value_scaling(
-    predicted_depth: torch.Tensor,
-    ground_truth_depth: torch.Tensor,
-    s: float = 1.0,
-    t: float = 0.0,
-) -> tuple[float, float]:
-    predicted_depth_np = predicted_depth.cpu().numpy().reshape(-1)
-    ground_truth_depth_np = ground_truth_depth.cpu().numpy().reshape(-1)
-
-    initial_params = [s, t]  # s = 1, t = 0
-
-    result = minimize(
-        absolute_error_loss,
-        initial_params,
-        args=(predicted_depth_np, ground_truth_depth_np),
-    )
-
-    s, t = result.x
-    return s, t
 
 
 def depth_evaluation(
@@ -190,8 +135,6 @@ def depth_evaluation(
     metric_scale: bool = False,
     scale_and_shift: bool = False,
     scale_only: bool = False,
-    lr: float = 1e-4,
-    max_iters: int = 1000,
     use_gpu: bool = False,
     disp_input: bool = False,
 ) -> tuple[dict[str, float], torch.Tensor]:
@@ -208,6 +151,15 @@ def depth_evaluation(
         dict: A dictionary containing the evaluation metrics.
         torch.Tensor: The depth error parity map.
     """
+    # validate the mode up front: without this, the no-flag default used to
+    # run median scaling, compute every metric, and only then die in the
+    # parity-map dispatch below
+    if not (metric_scale or scale_and_shift or scale_only):
+        raise ValueError(
+            "depth_evaluation requires an alignment mode: pass one of "
+            "metric_scale, scale_and_shift, or scale_only"
+        )
+
     if isinstance(predicted_depth_original, np.ndarray):
         predicted_depth_original = torch.from_numpy(predicted_depth_original)
     if isinstance(ground_truth_depth_original, np.ndarray):
@@ -252,16 +204,7 @@ def depth_evaluation(
     if metric_scale:
         predicted_depth = predicted_depth
     elif scale_and_shift:
-        s_init = (
-            torch.median(ground_truth_depth) / torch.median(predicted_depth)
-        ).item()
-        s, t = absolute_value_scaling2(
-            predicted_depth,
-            ground_truth_depth,
-            s_init=s_init,
-            lr=lr,
-            max_iters=max_iters,
-        )
+        s, t = closed_form_scale_and_shift(predicted_depth, ground_truth_depth)
         predicted_depth = s * predicted_depth + t
     elif scale_only:
         # Compute initial scale factor 's' using the closed-form solution (L2 norm)
@@ -296,15 +239,10 @@ def depth_evaluation(
         # Apply the scale factor to the predicted depth
         predicted_depth = s * predicted_depth
 
-    else:
-        # Align the predicted depth with the ground truth using median scaling
-        scale_factor = torch.median(ground_truth_depth) / torch.median(predicted_depth)
-        predicted_depth *= scale_factor
-
     if disp_input:
         # convert back to depth
         ground_truth_depth = real_gt
-        predicted_depth = depth2disparity(predicted_depth)
+        predicted_depth, _ = depth2disparity(predicted_depth)
 
     # Clip the predicted depth values
     if post_clip_min is not None:
@@ -352,7 +290,7 @@ def depth_evaluation(
     if metric_scale:
         predicted_depth_original = predicted_depth_original
         if disp_input:
-            predicted_depth_original = depth2disparity(predicted_depth_original)
+            predicted_depth_original, _ = depth2disparity(predicted_depth_original)
         depth_error_parity_map = (
             torch.abs(predicted_depth_original - ground_truth_depth_original)
             / ground_truth_depth_original
@@ -360,7 +298,7 @@ def depth_evaluation(
     elif scale_and_shift:
         predicted_depth_original = predicted_depth_original * s + t
         if disp_input:
-            predicted_depth_original = depth2disparity(predicted_depth_original)
+            predicted_depth_original, _ = depth2disparity(predicted_depth_original)
         depth_error_parity_map = (
             torch.abs(predicted_depth_original - ground_truth_depth_original)
             / ground_truth_depth_original
@@ -368,7 +306,7 @@ def depth_evaluation(
     elif scale_only:
         predicted_depth_original = predicted_depth_original * s
         if disp_input:
-            predicted_depth_original = depth2disparity(predicted_depth_original)
+            predicted_depth_original, _ = depth2disparity(predicted_depth_original)
         depth_error_parity_map = (
             torch.abs(predicted_depth_original - ground_truth_depth_original)
             / ground_truth_depth_original

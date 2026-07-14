@@ -340,6 +340,15 @@ def run(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
+    # fail at startup, not after args.epochs of training: the post-training
+    # streaming_eval drives StreamVGGT.inference, which treats the batch dim
+    # of frame["img"] as extra frames
+    if args.val_freq > 0 and args.batch_size != 1:
+        raise ValueError(
+            "batch_size must be 1 when validation is enabled (streaming_eval "
+            "requires it); pass --val-freq 0 to disable validation"
+        )
+
     data_loader_train = build_train_loader(args, Split.TRAIN, accelerator)
     data_loader_val = (
         build_train_loader(args, Split.TEST, accelerator) if args.val_freq > 0 else None
@@ -410,6 +419,7 @@ def run(
             args=args,
             mcfg=mcfg,
             save_model=save_model,
+            best_so_far=best_so_far,
         )
 
         # the loop breaks at `epoch >= args.epochs` before training, so the
@@ -430,8 +440,12 @@ def run(
                 args=args,
                 mcfg=mcfg,
             )
-            if val_stats["loss_med"] < best_so_far:
-                best_so_far = val_stats["loss_med"]
+            # select on the AVG, not the median: SmoothedValue syncs only
+            # count/total across ranks, so global_avg is global while median
+            # stays rank-local -- under DDP a median-based decision would use
+            # rank 0's shard only and best_so_far would diverge across ranks
+            if val_stats["loss_avg"] < best_so_far:
+                best_so_far = val_stats["loss_avg"]
                 save_model(epoch, "best", best_so_far, args.start_step)
 
     total_time = time.time() - start_time
@@ -462,6 +476,27 @@ def run(
     accelerator.end_training()
 
 
+def _set_data_epoch(data_loader: DataLoader, epoch: int) -> None:
+    """Propagate the epoch to the dataset and the sampler stack. Delegates to
+    accelerate's DataLoaderShard.set_epoch, which handles both the
+    single-process layout (batch_sampler IS the raw BatchedRandomSampler) and
+    the sharded one (BatchSamplerShard wrapping it). The duck-typed
+    data_loader.batch_sampler.batch_sampler hop this replaces silently no-oped
+    on single-process runs, leaving the sampler epoch unset ('Epoch number not
+    set' on the first batch). The dataset call stays explicit because
+    DataLoaderShard.set_epoch skips it on the sharded layout (elif), and
+    ResizedDataset.__getitem__ requires it; plain DataLoaders (tests) fall
+    through every guard."""
+    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
+        data_loader.dataset.set_epoch(epoch)
+    if hasattr(data_loader, "set_epoch"):  # accelerate DataLoaderShard
+        data_loader.set_epoch(epoch)
+    elif hasattr(data_loader, "batch_sampler") and hasattr(
+        data_loader.batch_sampler, "set_epoch"
+    ):  # not accelerator.prepare'd: the raw streamvggt batched sampler
+        data_loader.batch_sampler.set_epoch(epoch)
+
+
 def _prepare_batch(batch: list[dict], mcfg: MetricCfg) -> None:
     """Shared train/val batch preprocessing, in this order: rescale imgs to
     [0, 1], then attach the sparse-depth conditioning input (patch-masked
@@ -490,6 +525,7 @@ def train_loop(
     args: FinetuneDepthCfg,
     mcfg: MetricCfg,
     save_model: Callable[[int, str, float, int], None] | None = None,
+    best_so_far: float = float("inf"),
 ) -> dict:
     if not torch.backends.cuda.matmul.allow_tf32:
         raise RuntimeError("TF32 matmul must stay enabled (set at module import)")
@@ -500,15 +536,7 @@ def train_loop(
     header = "Epoch: [{}]".format(epoch)
     accum_iter = args.accum_iter
 
-    # duck-typed set_epoch plumbing ported verbatim from finetune.py
-    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
-        data_loader.dataset.set_epoch(epoch)
-    if (
-        hasattr(data_loader, "batch_sampler")
-        and hasattr(data_loader.batch_sampler, "batch_sampler")
-        and hasattr(data_loader.batch_sampler.batch_sampler, "set_epoch")
-    ):
-        data_loader.batch_sampler.batch_sampler.set_epoch(epoch)
+    _set_data_epoch(data_loader, epoch)
 
     optimizer.zero_grad()
 
@@ -588,7 +616,10 @@ def train_loop(
                 and data_iter_step != len(data_loader) - 1
             ):
                 print("saving at step", data_iter_step)
-                save_model(epoch - 1, "last", float("inf"), data_iter_step)
+                # pass the live best_so_far: a hardcoded inf here poisoned
+                # best tracking on resume from a mid-epoch checkpoint, letting
+                # a worse model overwrite checkpoint-best.pth
+                save_model(epoch - 1, "last", best_so_far, data_iter_step)
 
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
@@ -615,10 +646,11 @@ def _stack_depth_batch(
 def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     """Matrix mapping homogeneous pixel coords (u*z, v*z, z, 1) to world, the
     convention metrics.tae expects: inv(K_4x4 @ world2cam) = cam2world @
-    inv(K_4x4). K [3,3], pose [4,4] cam2world."""
-    k4 = np.eye(4)
+    inv(K_4x4). K [3,3], pose [4,4] cam2world. float32 throughout -- the
+    inputs are float32 and float64 doubles the TAE reprojection cost."""
+    k4 = np.eye(4, dtype=np.float32)
     k4[:3, :3] = K.numpy()
-    return pose.numpy().astype(np.float64) @ np.linalg.inv(k4)
+    return pose.numpy() @ np.linalg.inv(k4)
 
 
 def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]:
@@ -635,14 +667,10 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]
         mask = valid[b] & (gt[b] > 0)  # [S,H,W]
         if not mask.any():
             continue
-        # the 3rd return is the aligned full-size prediction, reused for TAE.
-        # enable_grad: the eval loops run under no_grad, but the s/t alignment
-        # (absolute_value_scaling2) optimizes with Adam and needs autograd
-        with torch.enable_grad():
-            res_affine, _, aligned, _ = depth_evaluation(
-                pred[b], gt[b], custom_mask=mask, scale_and_shift=True
-            )
-        aligned = aligned.detach()
+        # the 3rd return is the aligned full-size prediction, reused for TAE
+        res_affine, _, aligned, _ = depth_evaluation(
+            pred[b], gt[b], custom_mask=mask, scale_and_shift=True
+        )
         # affine-variant: raw prediction vs GT, measures metric alignment
         res_metric, _, _, _ = depth_evaluation(
             pred[b], gt[b], custom_mask=mask, metric_scale=True
@@ -652,7 +680,7 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]
         out.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
         out.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
 
-        aligned = torch.as_tensor(aligned).reshape(S, H, W).numpy()
+        aligned = aligned.reshape(S, H, W).numpy()
         mask_np = mask.numpy()
         i2l = [_img2lidar(K[b, i], pose[b, i]) for i in range(S)]
         errs = [
@@ -689,12 +717,9 @@ def _streaming_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, 
             mask = valid[b, i] & (gt[b, i] > 0)  # [H,W]
             if not mask.any():
                 continue
-            # enable_grad: the s/t alignment inside needs autograd (see
-            # _val_depth_metrics)
-            with torch.enable_grad():
-                res_affine, _, _, _ = depth_evaluation(
-                    pred[b, i], gt[b, i], custom_mask=mask, scale_and_shift=True
-                )
+            res_affine, _, _, _ = depth_evaluation(
+                pred[b, i], gt[b, i], custom_mask=mask, scale_and_shift=True
+            )
             res_metric, _, _, _ = depth_evaluation(
                 pred[b, i], gt[b, i], custom_mask=mask, metric_scale=True
             )
@@ -720,23 +745,65 @@ def _streaming_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, 
     return {k: float(np.mean(v)) for k, v in out.items()}
 
 
+# the full depth-metric key set, in one canonical order. The per-batch dicts
+# are data-dependent (a rank can see a clip with no valid pixels or no finite
+# TAE pair), so cross-rank reductions must run over this fixed list -- never
+# over whatever keys happened to fire on one rank.
+_DEPTH_METRIC_KEYS = (
+    "absrel_affine",
+    "delta1_affine",
+    "absrel_metric",
+    "delta1_metric",
+    "tae",
+)
+
+
+def _reduce_depth_metrics(
+    sums: dict[str, float], counts: dict[str, int], accelerator: Accelerator
+) -> dict[str, float]:
+    """Cross-rank mean of the depth-metric accumulators in ONE fixed-order
+    collective. Feeding the per-batch (data-dependent) keys through the
+    per-meter MetricLogger sync instead can pair mismatched meters across
+    ranks: an NCCL hang when key sets differ, silently mixed stats when only
+    the order does. Keys that never fired on any rank are omitted."""
+    t = torch.tensor(
+        [[sums[k], counts[k]] for k in _DEPTH_METRIC_KEYS],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
+        accelerator.reduce(t, reduction="sum")
+    return {
+        k: (t[i, 0] / t[i, 1]).item()
+        for i, k in enumerate(_DEPTH_METRIC_KEYS)
+        if t[i, 1] > 0
+    }
+
+
 def _log_val_stats(
     metric_logger: misc.MetricLogger,
+    depth_avgs: dict[str, float],
     accelerator: Accelerator,
     prefix: str,
     step: int,
 ) -> dict:
     """Whole-epoch avg/med aggregation + wandb logging, ported from
-    finetune.py::test_one_epoch."""
+    finetune.py::test_one_epoch. Loss meters get avg (globally reduced) and
+    med (rank-local -- SmoothedValue only syncs count/total); depth metrics
+    arrive pre-reduced as plain avgs."""
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
 
-    aggs = [("avg", "global_avg"), ("med", "median")]
-    results = {
-        f"{name}_{tag}": getattr(meter, attr)
-        for name, meter in metric_logger.meters.items()
-        for tag, attr in aggs
-    }
+    results = {}
+    for name, meter in metric_logger.meters.items():
+        if meter.count == 0:
+            continue
+        results[f"{name}_avg"] = meter.global_avg
+        if len(meter.deque):
+            results[f"{name}_med"] = meter.median
+    results.update({f"{k}_avg": v for k, v in depth_avgs.items()})
+
     log_dict = {}
     for name, val in results.items():
         if isinstance(val, torch.Tensor) and val.ndim > 0:
@@ -746,21 +813,6 @@ def _log_val_stats(
         log_dict[prefix + "_" + name] = val
     accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
     return results
-
-
-def _pin_val_data(data_loader: DataLoader) -> None:
-    """Pin the loader to epoch 0 so every val pass sees the identical clip set
-    and order: the sampler seeds its rng from epoch + 788 and ResizedDataset
-    its slot mapping from epoch + 777 -- the epoch number is their only
-    entropy. Same duck-typed plumbing as train_loop."""
-    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
-        data_loader.dataset.set_epoch(0)
-    if (
-        hasattr(data_loader, "batch_sampler")
-        and hasattr(data_loader.batch_sampler, "batch_sampler")
-        and hasattr(data_loader.batch_sampler.batch_sampler, "set_epoch")
-    ):
-        data_loader.batch_sampler.batch_sampler.set_epoch(0)
 
 
 @torch.no_grad()
@@ -785,7 +837,12 @@ def val_loop(
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
     header = "Val Epoch: [{}]".format(epoch)
-    _pin_val_data(data_loader)
+    # pin to epoch 0 every pass: the sampler seeds its rng from epoch + 788
+    # and ResizedDataset its slot mapping from epoch + 777, so this yields the
+    # identical clip set and order on every validation
+    _set_data_epoch(data_loader, 0)
+    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
+    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
 
     # fork + fix the torch RNG: the sparse-conditioning masks (torch.rand) and
     # query-point sampling are identical every epoch, and the training RNG
@@ -809,11 +866,14 @@ def val_loop(
                 use_amp=bool(args.amp),
             )
             loss_value, loss_details = result["loss"]
-            depth_stats = _val_depth_metrics(result["views"], result["pred"])
-            metric_logger.update(loss=float(loss_value), **loss_details, **depth_stats)
+            metric_logger.update(loss=float(loss_value), **loss_details)
+            for k, v in _val_depth_metrics(result["views"], result["pred"]).items():
+                depth_sums[k] += v
+                depth_counts[k] += 1
             del result, batch
 
-    results = _log_val_stats(metric_logger, accelerator, prefix, step)
+    depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
+    results = _log_val_stats(metric_logger, depth_avgs, accelerator, prefix, step)
     model.train(True)
     return results
 
@@ -844,7 +904,9 @@ def streaming_eval(
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
     header = "Streaming eval:"
-    _pin_val_data(data_loader)
+    _set_data_epoch(data_loader, 0)  # same epoch-0 pin as val_loop
+    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
+    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
 
     devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
@@ -864,12 +926,14 @@ def streaming_eval(
                 symmetrize_batch=False,
                 use_amp=bool(args.amp),
             )
-            metric_logger.update(
-                **_streaming_depth_metrics(result["views"], result["pred"])
-            )
+            stats = _streaming_depth_metrics(result["views"], result["pred"])
+            for k, v in stats.items():
+                depth_sums[k] += v
+                depth_counts[k] += 1
             del result, batch
 
-    return _log_val_stats(metric_logger, accelerator, prefix, step)
+    depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
+    return _log_val_stats(metric_logger, depth_avgs, accelerator, prefix, step)
 
 
 def main(cfg: FinetuneDepthCfg) -> None:

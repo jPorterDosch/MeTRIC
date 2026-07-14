@@ -300,6 +300,7 @@ def check_multi_config():
 
 def check_view_contract(data_dir):
     ran = 0
+    empty_roots = []
     for dsname, subdir, max_interval in DATA_CASES:
         root = data_dir / subdir
         if not root.exists():
@@ -317,8 +318,12 @@ def check_view_contract(data_dir):
         try:
             ds = cfg.build()
         except EmptyDatasetError as e:
-            # stub / partially-downloaded tree: data-dependent skip, caught
-            # by type (the shared empty-dataset contract), not message text
+            # the root EXISTS but the loader found zero scenes: either a
+            # partially-downloaded tree (tolerable) or a scene-glob regression
+            # (the exact class this check exists to catch). Tolerate it per
+            # dataset but track it -- if NO dataset runs, main() fails rather
+            # than reporting a false PASSED.
+            empty_roots.append(dsname.name)
             print(f"  [5] {dsname.name}: SKIP ({e})")
             continue
         # no silent overwrite
@@ -338,6 +343,16 @@ def check_view_contract(data_dir):
         med = float(np.median(depth[valid])) if valid.any() else -1.0
         print(f"  [5] {dsname.name}: OK  len={len(ds)}  depth_med={med:.2f}m")
         ran += 1
+    assert ran > 0 or not empty_roots, (
+        f"every present data tree produced zero scenes ({empty_roots}): "
+        "either the downloads are all stubs or the scene discovery regressed"
+    )
+    if empty_roots:
+        print(
+            f"  [5] WARNING: {len(empty_roots)} present tree(s) had zero scenes "
+            f"({', '.join(empty_roots)}) -- verify they are partial downloads, "
+            "not a loader regression"
+        )
     return ran
 
 
