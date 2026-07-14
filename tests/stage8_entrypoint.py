@@ -42,11 +42,15 @@ def driver() -> None:
     from finetune_depth import FinetuneDepthCfg
     from synthetic import synthetic_loader
 
-    # swap the dust3r dataset construction for the synthetic loader; everything
+    # swap the real dataset construction for the synthetic loader; everything
     # downstream (accelerate.prepare, the epoch loop, saving, resume) is real.
-    def fake_build_dataset(
-        dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False
-    ):
+    # build_train_loader is the module-level seam the train loop resolves at
+    # call time, so replacing the attribute takes effect. It serves BOTH
+    # splits, so the val/streaming passes run on synthetic data too. The
+    # batch_size override (run() requests a batch-1 loader for streaming_eval
+    # when args.batch_size > 1) is ignored: synthetic_loader is already
+    # batch-1 by construction.
+    def fake_build_train_loader(args, split, accelerator, batch_size=None):
         # 224x224 (16x16 patch grid): large enough that the track head's
         # correlation pyramid does not pool down to 0x0 (it runs because
         # loss_of_one_batch samples query points from valid_mask).
@@ -57,7 +61,7 @@ def driver() -> None:
             W=224,
         )
 
-    finetune_depth.build_dataset = fake_build_dataset
+    finetune_depth.build_train_loader = fake_build_train_loader
 
     cfg = FinetuneDepthCfg(
         pretrained="",  # skip the 5GB pretrained load; this is a plumbing test
@@ -65,7 +69,6 @@ def driver() -> None:
         exp_name="stage8",
         epochs=int(os.environ["SC_EPOCHS"]),
         save_freq=0.5,  # int(0.5 * 12 steps) = 6 -> one mid-epoch save at step 6
-        keep_freq=999,  # skip numbered per-epoch checkpoints (keep the test lean)
         print_freq=5,
         batch_size=1,
         num_workers=0,
@@ -116,14 +119,21 @@ def run_checks() -> None:
         assert "saving at step" in rA.stdout, (
             "mid-epoch checkpoint-last save never fired"
         )
+        assert "Val Epoch: [0]" in rA.stdout, "val_loop never ran (val_freq=1 default)"
+        assert "Streaming eval:" in rA.stdout, "post-training streaming_eval never ran"
 
         dirs = [d for d in os.listdir(save_dir) if d.startswith("stage8_")]
         assert len(dirs) == 1, f"expected one output dir, got {dirs}"
         out = os.path.join(save_dir, dirs[0])
-        for fname in ("manifest.json", "checkpoint-last.pth", "checkpoint-final.pth"):
+        for fname in (
+            "manifest.json",
+            "checkpoint-last.pth",
+            "checkpoint-best.pth",
+            "checkpoint-final.pth",
+        ):
             assert os.path.isfile(os.path.join(out, fname)), f"missing {fname} in {out}"
         print(
-            "[stage8] run A: e2e train() completed; manifest + mid-epoch + final checkpoints written"
+            "[stage8] run A: e2e train() completed; manifest + mid-epoch + best + final checkpoints written; val + streaming eval ran"
         )
 
         # --- artifact is loadable from a process WITHOUT streamvggt on the path

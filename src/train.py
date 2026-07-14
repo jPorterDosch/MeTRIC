@@ -315,8 +315,6 @@ def train(args):
         new_best = False
 
         if epoch > args.start_epoch:
-            if args.keep_freq and epoch % args.keep_freq == 0:
-                save_model(epoch - 1, str(epoch), best_so_far, args.start_step)
             if new_best:
                 save_model(epoch - 1, "best", best_so_far, args.start_step)
         if epoch >= args.epochs:
