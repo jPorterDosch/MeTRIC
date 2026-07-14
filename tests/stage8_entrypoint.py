@@ -69,7 +69,6 @@ def driver() -> None:
         exp_name="stage8",
         epochs=int(os.environ["SC_EPOCHS"]),
         save_freq=0.5,  # int(0.5 * 12 steps) = 6 -> one mid-epoch save at step 6
-        keep_freq=999,  # skip numbered per-epoch checkpoints (keep the test lean)
         print_freq=5,
         batch_size=1,
         num_workers=0,
