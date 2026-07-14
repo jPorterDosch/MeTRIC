@@ -187,7 +187,6 @@ class FinetuneDepthCfg:
     # logging / saving cadence (not part of the experiment identity)
     print_freq: int = 10
     save_freq: float = 0.1
-    keep_freq: int = 1
 
     # derived at startup (do not set on the CLI)
     output_dir: str = ""
@@ -205,7 +204,6 @@ _NON_IDENTITY_FIELDS = (
     "start_step",
     "print_freq",
     "save_freq",
-    "keep_freq",
     "num_workers",
     "benchmark",
 )
@@ -419,8 +417,6 @@ def run(
                 or epoch == args.epochs
             ):
                 save_model(epoch - 1, "last", best_so_far, args.start_step)
-            if args.keep_freq and epoch % args.keep_freq == 0:
-                save_model(epoch - 1, str(epoch), best_so_far, args.start_step)
         if epoch >= args.epochs:
             break
 

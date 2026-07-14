@@ -81,6 +81,10 @@ def closed_form_scale_and_shift(
     p = predicted_depth.reshape(-1).double()
     g = ground_truth_depth.reshape(-1).double()
     n = float(p.numel())
+
+    if n == 0:
+        return float("nan"), float("nan")
+
     sp, sg = p.sum(), g.sum()
     spp, spg = p @ p, p @ g
     det = spp * n - sp * sp
