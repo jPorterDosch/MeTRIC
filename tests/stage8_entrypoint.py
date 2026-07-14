@@ -46,8 +46,11 @@ def driver() -> None:
     # downstream (accelerate.prepare, the epoch loop, saving, resume) is real.
     # build_train_loader is the module-level seam the train loop resolves at
     # call time, so replacing the attribute takes effect. It serves BOTH
-    # splits, so the val/streaming passes run on synthetic data too.
-    def fake_build_train_loader(args, split, accelerator):
+    # splits, so the val/streaming passes run on synthetic data too. The
+    # batch_size override (run() requests a batch-1 loader for streaming_eval
+    # when args.batch_size > 1) is ignored: synthetic_loader is already
+    # batch-1 by construction.
+    def fake_build_train_loader(args, split, accelerator, batch_size=None):
         # 224x224 (16x16 patch grid): large enough that the track head's
         # correlation pyramid does not pool down to 0x0 (it runs because
         # loss_of_one_batch samples query points from valid_mask).

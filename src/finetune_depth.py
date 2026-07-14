@@ -216,12 +216,18 @@ def build_manifest(cfg: FinetuneDepthCfg) -> dict:
 
 
 def build_train_loader(
-    args: FinetuneDepthCfg, split: Split, accelerator
+    args: FinetuneDepthCfg,
+    split: Split,
+    accelerator,
+    batch_size: int | None = None,
 ) -> torch.utils.data.DataLoader:
     """Build the dataset mixture (one CatDataset over every configured
     dataset, mirroring the original `N @ ds1 + M @ ds2` recipes) and wrap it
-    in the batched-sampler loader.
+    in the batched-sampler loader. batch_size overrides args.batch_size when
+    given (streaming_eval needs a batch-1 loader over the val config).
     """
+    if batch_size is None:
+        batch_size = args.batch_size
     match split:
         case Split.TRAIN:
             printer.info("Building train datasets %s", args.train_dataset)
@@ -233,7 +239,7 @@ def build_train_loader(
             )
             return get_data_loader(
                 train_dataset,
-                batch_size=args.batch_size,
+                batch_size=batch_size,
                 num_workers=args.num_workers,
                 shuffle=True,
                 drop_last=True,
@@ -253,7 +259,7 @@ def build_train_loader(
             # (make_sampler raises NotImplementedError on shuffle=False.)
             return get_data_loader(
                 val_dataset,
-                batch_size=args.batch_size,
+                batch_size=batch_size,
                 num_workers=args.num_workers,
                 shuffle=True,
                 drop_last=False,
@@ -340,19 +346,21 @@ def run(
     seed_everything(seed)
     cudnn.benchmark = args.benchmark
 
-    # fail at startup, not after args.epochs of training: the post-training
-    # streaming_eval drives StreamVGGT.inference, which treats the batch dim
-    # of frame["img"] as extra frames
-    if args.val_freq > 0 and args.batch_size != 1:
-        raise ValueError(
-            "batch_size must be 1 when validation is enabled (streaming_eval "
-            "requires it); pass --val-freq 0 to disable validation"
-        )
-
     data_loader_train = build_train_loader(args, Split.TRAIN, accelerator)
     data_loader_val = (
         build_train_loader(args, Split.TEST, accelerator) if args.val_freq > 0 else None
     )
+    # streaming_eval drives StreamVGGT.inference, which folds the batch dim of
+    # frame["img"] into the sequence, so it must see one clip at a time: give
+    # it its own batch-1 loader over the val config instead of constraining
+    # the whole run's batch_size (reuse the val loader when it is already 1)
+    data_loader_stream = None
+    if data_loader_val is not None:
+        data_loader_stream = (
+            data_loader_val
+            if args.batch_size == 1
+            else build_train_loader(args, Split.TEST, accelerator, batch_size=1)
+        )
 
     printer.info("Loading depth-conditioned model")
     model, _ = build_model(args, mcfg, device)
@@ -375,7 +383,15 @@ def run(
         optimizer, model, data_loader_train
     )
     if data_loader_val is not None:
+        stream_is_val = data_loader_stream is data_loader_val
         data_loader_val = accelerator.prepare(data_loader_val)
+        # the stream loader is prepared too so it shards across ranks the same
+        # way (_reduce_depth_metrics assumes every rank walked its own shard)
+        data_loader_stream = (
+            data_loader_val
+            if stream_is_val
+            else accelerator.prepare(data_loader_stream)
+        )
 
     def save_model(
         epoch: int, fname: str, best_so_far: float, data_iter_step: int
@@ -455,10 +471,10 @@ def run(
 
     # final causal evaluation on the deployment (per-frame KV-cache) path;
     # must run before the final save below moves the model to cpu
-    if data_loader_val is not None:
+    if data_loader_stream is not None:
         streaming_eval(
             model,
-            data_loader_val,
+            data_loader_stream,
             accelerator,
             step=args.epochs * len(data_loader_train),
             args=args,
@@ -653,12 +669,14 @@ def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     return pose.numpy() @ np.linalg.inv(k4)
 
 
-def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]:
+def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[float]]:
     """Sequence-level depth metrics for one batch: affine-invariant (one lstsq
     scale/shift over the whole clip) and metric (no-alignment) AbsRel /
     delta<1.25, plus TAE over adjacent frames of the ALIGNED prediction. The
     whole-clip alignment is non-causal -- fine for the training-forward val
-    pass; the streaming eval uses _streaming_depth_metrics instead."""
+    pass; the streaming eval uses _streaming_depth_metrics instead.
+    Returns PER-CLIP value lists (not batch means) so the caller's
+    accumulation weights every clip equally regardless of batch size."""
     pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
 
     out: dict[str, list[float]] = {}
@@ -697,14 +715,17 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]
         errs = [e for e in errs if np.isfinite(e)]
         if errs:
             out.setdefault("tae", []).append(float(np.mean(errs)))
-    return {k: float(np.mean(v)) for k, v in out.items()}
+    return out
 
 
-def _streaming_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, float]:
+def _streaming_depth_metrics(
+    views: list[dict], preds: list[dict]
+) -> dict[str, list[float]]:
     """Causal variant for the streaming eval: no metric sees a future frame.
     AbsRel / delta<1.25 are per-frame (metric = raw pred; affine = per-frame
     lstsq), and TAE compares consecutive RAW predictions -- only the prior
-    frame is retained, mirroring deployment, and no alignment jitter leaks in."""
+    frame is retained, mirroring deployment, and no alignment jitter leaks in.
+    Returns per-clip value lists, like _val_depth_metrics."""
     pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
 
     out: dict[str, list[float]] = {}
@@ -742,7 +763,7 @@ def _streaming_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, 
             out.setdefault(k, []).append(float(np.mean(v)))
         if errs:
             out.setdefault("tae", []).append(float(np.mean(errs)))
-    return {k: float(np.mean(v)) for k, v in out.items()}
+    return out
 
 
 # the full depth-metric key set, in one canonical order. The per-batch dicts
@@ -867,9 +888,9 @@ def val_loop(
             )
             loss_value, loss_details = result["loss"]
             metric_logger.update(loss=float(loss_value), **loss_details)
-            for k, v in _val_depth_metrics(result["views"], result["pred"]).items():
-                depth_sums[k] += v
-                depth_counts[k] += 1
+            for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
+                depth_sums[k] += float(np.sum(vals))
+                depth_counts[k] += len(vals)
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
@@ -892,13 +913,12 @@ def streaming_eval(
     (MetricStreamVGGT.inference), with causal metrics only. The inference
     branch of loss_of_one_batch returns dict(views, pred) with no loss key,
     so no criterion runs here. Keys are namespaced by the prefix, keeping
-    them apart from the non-causal val_* series."""
-    if args.batch_size != 1:
-        raise ValueError(
-            "streaming_eval requires batch_size=1: StreamVGGT.inference "
-            "treats the batch dim of frame['img'] as extra frames"
-        )
+    them apart from the non-causal val_* series.
 
+    data_loader must yield ONE clip per batch (run() builds a dedicated
+    batch-1 loader over the val config): StreamVGGT.inference folds the batch
+    dim of frame["img"] into the sequence, so B>1 would silently interleave
+    clips into one KV-cache stream. Checked per batch below."""
     model.eval()
     net = accelerator.unwrap_model(model)  # the DDP wrapper has no .inference
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -916,6 +936,12 @@ def streaming_eval(
         for _, batch in enumerate(
             metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
         ):
+            if batch[0]["img"].shape[0] != 1:
+                raise ValueError(
+                    "streaming_eval needs a batch-1 loader (got batch size "
+                    f"{batch[0]['img'].shape[0]}): StreamVGGT.inference treats "
+                    "the batch dim of frame['img'] as extra frames"
+                )
             _prepare_batch(batch, mcfg)
             result = loss_of_one_batch(
                 batch,
@@ -927,9 +953,9 @@ def streaming_eval(
                 use_amp=bool(args.amp),
             )
             stats = _streaming_depth_metrics(result["views"], result["pred"])
-            for k, v in stats.items():
-                depth_sums[k] += v
-                depth_counts[k] += 1
+            for k, vals in stats.items():
+                depth_sums[k] += float(np.sum(vals))
+                depth_counts[k] += len(vals)
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
