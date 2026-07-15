@@ -15,6 +15,6 @@ mkdir -p "$DOWNLOAD_DIR"
 # so the two variants partition the scenes without overlap.
 python $SCRIPT_DIR/download_arkit_scenes.py raw \
     --download_dir "$DOWNLOAD_DIR" \
-    --video_id_csv raw/raw_train_val_splits.csv \
+    --video_id_csv "$SCRIPT_DIR/raw/raw_train_val_splits.csv" \
     --raw_dataset_assets highres_depth lowres_depth vga_wide vga_wide_intrinsics lowres_wide.traj \
-    --num_workers 8
+    --num_workers "${NUM_WORKERS:-8}"

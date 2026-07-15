@@ -104,7 +104,9 @@ def download_file(url, file_name, dst):
     filepath = os.path.join(dst, file_name)
 
     if not os.path.isfile(filepath):
-        command = f"curl {url} -o {file_name}.tmp --fail"
+        # -sS: no progress meter (useless interleaved noise with parallel
+        # workers, and it bloats redirected logs), but still print errors
+        command = f"curl -sS {url} -o {file_name}.tmp --fail"
         print(f"Downloading file {filepath}")
         try:
             subprocess.check_call(command, shell=True, cwd=dst)
@@ -114,20 +116,6 @@ def download_file(url, file_name, dst):
         os.rename(filepath + ".tmp", filepath)
     else:
         print(f"WARNING: skipping download of existing file: {filepath}")
-    return True
-
-
-def unzip_file(file_name, dst, keep_zip=True):
-    filepath = os.path.join(dst, file_name)
-    print(f"Unzipping zip file {filepath}")
-    command = f"unzip -oq {filepath} -d {dst}"
-    try:
-        subprocess.check_call(command, shell=True)
-    except Exception as error:
-        print(f"Error unzipping {filepath}, error: {error}")
-        return False
-    if not keep_zip:
-        os.remove(filepath)
     return True
 
 
@@ -230,7 +218,6 @@ def download_data(
     video_ids,
     dataset_splits,
     download_dir,
-    keep_zip,
     raw_dataset_assets,
     should_download_laser_scanner_point_cloud,
     num_workers=1,
@@ -283,14 +270,11 @@ def download_data(
             dst_path = os.path.join(dst_dir, file_name)
             url = url_prefix.format(file_name)
 
-            if not file_name.endswith(".zip") or not os.path.isdir(
-                dst_path[: -len(".zip")]
-            ):
-                download_file(url, dst_path, dst_dir)
-            else:
-                print(f"WARNING: skipping download of existing zip file: {dst_path}")
-            if file_name.endswith(".zip") and os.path.isfile(dst_path):
-                unzip_file(file_name, dst_dir, keep_zip)
+            # zips are kept as downloaded and NEVER extracted (inode budget:
+            # ~5 files/scene instead of ~15k); resume = final zip exists,
+            # which download_file already checks, and its .tmp+rename means
+            # a final-named zip is always complete
+            download_file(url, dst_path, dst_dir)
 
     unique_video_ids = sorted(set(video_ids))
     if num_workers <= 1:
@@ -343,8 +327,6 @@ if __name__ == "__main__":
         default=os.path.expanduser("~/scratch/data/arkit_scenes"),
     )
 
-    parser.add_argument("--keep_zip", action="store_true")
-
     parser.add_argument("--download_laser_scanner_point_cloud", action="store_true")
 
     parser.add_argument(
@@ -389,7 +371,6 @@ if __name__ == "__main__":
         video_ids_,
         splits_,
         args.download_dir,
-        args.keep_zip,
         args.raw_dataset_assets,
         args.download_laser_scanner_point_cloud,
         args.num_workers,

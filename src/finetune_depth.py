@@ -102,7 +102,7 @@ class FinetuneDepthCfg:
     exp_name: str = "metric_depth_cond"
 
     # optimization
-    seed: int = 0
+    seed: int = 42
     batch_size: int = 1
     accum_iter: int = 1
     epochs: int = 10
