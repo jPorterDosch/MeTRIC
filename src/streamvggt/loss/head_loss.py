@@ -113,7 +113,8 @@ class DepthOrPmapLoss(torch.nn.Module):
         sigma_p: torch.Tensor | None = None,
         sigma_g: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.metric:
             # Metric supervision: compare raw predicted depth against raw GT,
             # with no normalization or scale/shift fit, so absolute scale is
@@ -149,8 +150,19 @@ class DepthOrPmapLoss(torch.nn.Module):
                 pred_aligned, gt_normalized, valid_mask
             )
         reg_loss = -self.alpha * torch.log(sigma.clamp(min=1e-6))[valid_mask].mean()
-        # return main + reg
-        return self.gamma * main_loss + grad_loss + reg_loss
+        main_term = self.gamma * main_loss
+        total = main_term + grad_loss + reg_loss
+        if return_components:
+            # detached copies for logging only; `total` keeps its graph so the
+            # caller still backprops through the full summed loss. main =
+            # confidence-weighted L1, grad = spatial-gradient/edge, reg =
+            # -alpha*log(sigma) confidence regularizer. They sum to `total`.
+            return total, {
+                "main": main_term.detach(),
+                "grad": grad_loss.detach(),
+                "reg": reg_loss.detach(),
+            }
+        return total
 
 
 class TrackLoss(torch.nn.Module):

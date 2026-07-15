@@ -78,20 +78,27 @@ class DepthTrainLoss(MultiLoss):
 
         # ---------- Ldepth ----------
         depth_terms = []
-        for g, p in zip(gts, preds):
+        # per-frame breakdown of Ldepth for logging: main (confidence-weighted
+        # L1), grad (spatial-gradient/edge), reg (-alpha*log(sigma) confidence
+        # regularizer). They sum to Ldepth; logged separately so the metric-mode
+        # balance between the accuracy term and the regularizer is visible.
+        comp_terms: dict[str, list[torch.Tensor]] = {"main": [], "grad": [], "reg": []}
+        for g, p in zip(gts, preds, strict=True):
             if "depth" in p:
                 sigma_p = p["depth_conf"]
                 valid_mask = g["valid_mask"]
                 if not valid_mask.any():
                     valid_mask = torch.ones_like(g["valid_mask"])
-                depth_terms.append(
-                    self.depth_loss(
-                        p["depth"],
-                        g["depthmap"].unsqueeze(-1),
-                        sigma_p=sigma_p,
-                        valid_mask=valid_mask,
-                    )
+                term, comps = self.depth_loss(
+                    p["depth"],
+                    g["depthmap"].unsqueeze(-1),
+                    sigma_p=sigma_p,
+                    valid_mask=valid_mask,
+                    return_components=True,
                 )
+                depth_terms.append(term)
+                for k, v in comps.items():
+                    comp_terms[k].append(v)
         Ldepth = (
             torch.stack(depth_terms).mean()
             if depth_terms
@@ -106,5 +113,13 @@ class DepthTrainLoss(MultiLoss):
         for loss, weight in zip(losses, self.weights, strict=True):
             total += weight * loss[0]
             details[loss[1]] = loss[0]
+
+        # logging-only breakdown of Ldepth (NOT added to total; detached in
+        # DepthOrPmapLoss). Zeros when no frame carried a depth prediction,
+        # mirroring Ldepth's own fallback.
+        for name, terms in comp_terms.items():
+            details[f"Ldepth_{name}"] = (
+                torch.stack(terms).mean() if terms else torch.zeros_like(Ltemporal)
+            )
 
         return total, details

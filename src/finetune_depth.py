@@ -52,6 +52,8 @@ from streamvggt.depth_cond import (
 )
 from eval.temporal_consistency.metrics import depth_evaluation, tae
 from finetune import save_current_code, setup_for_distributed  # reuse
+from streamvggt.utils.geometry import unproject_depth_map_to_point_map
+from visual_util import predictions_to_glb
 from streamvggt.datasets import (
     CatDataset,
     DatasetName,
@@ -188,6 +190,13 @@ class FinetuneDepthCfg:
     print_freq: int = 10
     save_freq: float = 0.1
 
+    # visualization: export predicted-depth point clouds (.glb) during the
+    # val / streaming-eval passes to <output_dir>/glb/. Off by default; the
+    # cap bounds how many clips are written per pass (accumulated over the
+    # first batches). Not part of the experiment identity.
+    export_glb: bool = False
+    export_glb_max_clips: int = 4
+
     # derived at startup (do not set on the CLI)
     output_dir: str = ""
 
@@ -206,6 +215,8 @@ _NON_IDENTITY_FIELDS = (
     "save_freq",
     "num_workers",
     "benchmark",
+    "export_glb",
+    "export_glb_max_clips",
 )
 
 
@@ -655,6 +666,87 @@ def _stack_depth_batch(
     return pred, gt, valid, K, pose
 
 
+def _clip_predictions(
+    img: torch.Tensor,
+    depth: torch.Tensor,
+    valid: torch.Tensor,
+    K: torch.Tensor,
+    pose: torch.Tensor,
+) -> dict:
+    """Assemble the numpy `predictions` dict predictions_to_glb consumes, for a
+    single clip. Inputs are the per-clip slices of _stack_depth_batch plus the
+    images: img [S,3,H,W] in [0,1], depth [S,H,W], valid [S,H,W] bool,
+    K [S,3,3], pose [S,4,4] cam2world.
+
+    Both the unprojector and predictions_to_glb want world->cam extrinsics of
+    shape [S,3,4] -- depth_to_world_coords_points is documented "cam from
+    world", and the glb builder inverts extrinsic to place the camera frustums
+    -- so we invert the cam2world pose ONCE and hand the same array to both;
+    point cloud and cameras then live in one frame. Invalid pixels get zero
+    confidence, which predictions_to_glb's conf>1e-5 filter drops (paired with
+    conf_thres=0.0, so no valid pixels are thresholded out)."""
+    world2cam = np.linalg.inv(pose.numpy())[:, :3, :4].astype(np.float32)  # [S,3,4]
+    # the unprojector does a hard np.squeeze(-1) per frame, so it needs the
+    # trailing singleton (_stack_depth_batch already dropped it -> [S,H,W])
+    world_points = unproject_depth_map_to_point_map(
+        depth.numpy()[..., None], world2cam, K.numpy()
+    )  # [S,H,W,3]
+    # confidence = GT-valid AND finite prediction. Dropping non-finite pixels
+    # matters: a NaN/Inf predicted depth (bad/early ckpt) at a GT-valid pixel
+    # would survive predictions_to_glb's conf>1e-5 filter and poison the
+    # np.percentile scene-scale (-> NaN camera sizing for the whole clip).
+    conf = (valid & torch.isfinite(depth)).numpy().astype(np.float32)
+    return {
+        "world_points_from_depth": world_points,
+        "depth_conf": conf,
+        "images": img.numpy(),
+        "extrinsic": world2cam,
+    }
+
+
+def _export_eval_glbs(
+    views: list[dict],
+    preds: list[dict],
+    out_dir: str,
+    tag: str,
+    accelerator: Accelerator,
+    start_idx: int,
+    max_clips: int,
+) -> int:
+    """Write up to (max_clips - start_idx) predicted-depth point clouds from
+    THIS batch to <out_dir>/glb/<tag>_clipN.glb and return how many were
+    written, so the caller can accumulate across batches until it reaches
+    max_clips. N is a pass-global index so clips from successive batches do not
+    collide. Main process only: the export is redundant across ranks (the val /
+    stream loaders shard the same clip set), and predictions_to_glb prints /
+    does file IO we do not want N-fold."""
+    if not accelerator.is_main_process or start_idx >= max_clips:
+        return 0
+    glb_dir = os.path.join(out_dir, "glb")
+    os.makedirs(glb_dir, exist_ok=True)
+    # img is not in _stack_depth_batch; stack it the same way ([B,S,3,H,W])
+    imgs = torch.stack([v["img"] for v in views], dim=1).float().cpu()
+    pred, _, valid, K, pose = _stack_depth_batch(views, preds)
+    written = 0
+    for b in range(pred.shape[0]):
+        if start_idx + written >= max_clips:
+            break
+        predictions = _clip_predictions(imgs[b], pred[b], valid[b], K[b], pose[b])
+        # prediction_mode without "Pointmap" takes the world_points_from_depth
+        # branch directly (no missing-key fallback warning)
+        scene = predictions_to_glb(
+            predictions,
+            conf_thres=0.0,
+            show_cam=True,
+            prediction_mode="Depthmap and Camera",
+        )
+        scene.export(
+            file_obj=os.path.join(glb_dir, f"{tag}_clip{start_idx + written}.glb")
+        )
+        written += 1
+    return written
+
+
 def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     """Matrix mapping homogeneous pixel coords (u*z, v*z, z, 1) to world, the
     convention metrics.tae expects: inv(K_4x4 @ world2cam) = cam2world @
@@ -860,6 +952,7 @@ def val_loop(
     _set_data_epoch(data_loader, 0)
     depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
     depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    glb_exported = 0
 
     # fork + fix the torch RNG: the sparse-conditioning masks (torch.rand) and
     # query-point sampling are identical every epoch, and the training RNG
@@ -887,6 +980,16 @@ def val_loop(
             for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
+            if args.export_glb:
+                glb_exported += _export_eval_glbs(
+                    result["views"],
+                    result["pred"],
+                    args.output_dir,
+                    tag=f"{prefix}_epoch{epoch}",
+                    accelerator=accelerator,
+                    start_idx=glb_exported,
+                    max_clips=args.export_glb_max_clips,
+                )
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
@@ -923,6 +1026,7 @@ def streaming_eval(
     _set_data_epoch(data_loader, 0)  # same epoch-0 pin as val_loop
     depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
     depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    glb_exported = 0
 
     devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
@@ -952,6 +1056,16 @@ def streaming_eval(
             for k, vals in stats.items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
+            if args.export_glb:
+                glb_exported += _export_eval_glbs(
+                    result["views"],
+                    result["pred"],
+                    args.output_dir,
+                    tag=prefix,
+                    accelerator=accelerator,
+                    start_idx=glb_exported,
+                    max_clips=args.export_glb_max_clips,
+                )
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
