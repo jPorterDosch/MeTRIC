@@ -88,9 +88,17 @@ class DepthTrainLoss(MultiLoss):
         depth_terms = []
         # per-frame breakdown of Ldepth for logging: main (confidence-weighted
         # L1), grad (spatial-gradient/edge), reg (-alpha*log(sigma) confidence
-        # regularizer). They sum to Ldepth; logged separately so the metric-mode
-        # balance between the accuracy term and the regularizer is visible.
-        comp_terms: dict[str, list[torch.Tensor]] = {"main": [], "grad": [], "reg": []}
+        # regularizer) -- these three sum to Ldepth. main_raw (sigma-free error)
+        # and conf (mean sigma) are diagnostics that DECOMPOSE main = conf*error
+        # (not summands); they separate an accuracy overfit from a confidence
+        # overfit when main climbs on val.
+        comp_terms: dict[str, list[torch.Tensor]] = {
+            "main": [],
+            "grad": [],
+            "reg": [],
+            "main_raw": [],  # sigma-free error: main / conf, tracks accuracy
+            "conf": [],  # mean confidence sigma: the weight applied to main
+        }
         for g, p in zip(gts, preds, strict=True):
             if "depth" in p:
                 sigma_p = p["depth_conf"]

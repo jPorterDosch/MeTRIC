@@ -101,7 +101,12 @@ class FinetuneDepthCfg:
     pretrained: str = "../ckpt/checkpoints.pth"
     resume: str | None = None
     save_dir: str = "../checkpoints"
-    exp_name: str = "metric_depth_cond"
+    exp_group: str = "metric_depth_cond"
+    """Experiment / sweep label. Every run sharing it is bucketed under one group
+    in the wandb UI and nests its runs under ``<save_dir>/<exp_group>/<run_id>``; the
+    run_id (config hash) distinguishes the individual arms within the sweep, so a
+    whole ablation ladder gets one --exp-group. Naming only -- NOT part of the
+    config hash."""
 
     # optimization
     seed: int = 0
@@ -206,7 +211,7 @@ class FinetuneDepthCfg:
 # config -- nested depth_cond/lora/cache/train blocks included -- is hashed.
 _NON_IDENTITY_FIELDS = (
     "save_dir",
-    "exp_name",
+    "exp_group",
     "output_dir",
     "resume",
     "start_epoch",
@@ -333,7 +338,10 @@ def run(
 
     wandb_config = {**to_primitive(args), **manifest, **record}
     wandb_init_kwargs = {
-        "name": f"{args.exp_name}_{run_id}",
+        "name": f"{args.exp_group}_{run_id}",
+        # group -> every run sharing exp_group is bucketed together in the wandb
+        # UI (e.g. all arms of one ablation ladder); run_id keeps names unique
+        "group": args.exp_group,
         "dir": args.output_dir,
     }
     if WANDB_ENTITY:
@@ -803,8 +811,12 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         )
         out.setdefault(f"{ds}/absrel_affine", []).append(res_affine["Abs Rel"])
         out.setdefault(f"{ds}/delta1_affine", []).append(res_affine["delta < 1.25"])
+        out.setdefault(f"{ds}/rmse_affine", []).append(res_affine["RMSE"])
         out.setdefault(f"{ds}/absrel_metric", []).append(res_metric["Abs Rel"])
         out.setdefault(f"{ds}/delta1_metric", []).append(res_metric["delta < 1.25"])
+        # RMSE in metres: absolute error magnitude the relative AbsRel hides --
+        # the calibration number for a metric-conditioned model.
+        out.setdefault(f"{ds}/rmse_metric", []).append(res_metric["RMSE"])
 
         aligned = aligned.reshape(S, H, W).numpy()
         mask_np = mask.numpy()
@@ -857,10 +869,13 @@ def _streaming_depth_metrics(
             frame_stats.setdefault("delta1_affine", []).append(
                 res_affine["delta < 1.25"]
             )
+            frame_stats.setdefault("rmse_affine", []).append(res_affine["RMSE"])
             frame_stats.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
             frame_stats.setdefault("delta1_metric", []).append(
                 res_metric["delta < 1.25"]
             )
+            # RMSE in metres: absolute error the relative AbsRel hides
+            frame_stats.setdefault("rmse_metric", []).append(res_metric["RMSE"])
 
             cur = (
                 pred[b, i].numpy(),
@@ -1137,7 +1152,7 @@ def main(cfg: FinetuneDepthCfg) -> None:
     run_hash = experiment_hash(manifest)  # full, canonical identity (record + wandb)
     run_id = experiment_id(manifest)  # short display id, single source of truth
     cfg.output_dir = resolve_output_dir(cfg, run_id)
-    print(f"Experiment {cfg.exp_name} id {run_id} -> {cfg.output_dir}")
+    print(f"Experiment {cfg.exp_group} id {run_id} -> {cfg.output_dir}")
 
     run(cfg, mcfg, manifest, run_hash, run_id)
 

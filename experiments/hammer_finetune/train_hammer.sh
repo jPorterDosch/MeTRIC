@@ -52,7 +52,7 @@ mkdir -p "$REPO/logs"
 cd "$REPO/src"
 
 python finetune_depth.py \
-    --exp-name hammer_depth_cond_head \
+    --exp-group hammer_depth_cond_head \
     \
     `# --- model / checkpointing -------------------------------------------` \
     `# pretrained StreamVGGT weights; the whole backbone stays frozen`        \

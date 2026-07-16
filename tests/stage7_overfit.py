@@ -101,7 +101,7 @@ def check_hash_and_collision() -> None:
         cfg = make_cfg(InjectionType.HEAD)
         cfg.save_dir = tmp
         rid = experiment_id(build_manifest(cfg))
-        out = os.path.join(tmp, f"{cfg.exp_name}_{rid}")
+        out = os.path.join(tmp, cfg.exp_group, rid)
         os.makedirs(out)  # merely created, no checkpoints inside
         try:
             resolve_output_dir(cfg, rid)

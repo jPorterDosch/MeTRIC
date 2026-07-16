@@ -1,38 +1,38 @@
 #!/bin/bash
-#SBATCH --job-name=hammer_logdepth
+#SBATCH --job-name=hm_headinj_lora
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --constraint=l40s
 #SBATCH --time=48:00:00
-#SBATCH --output=/oscar/home/jdosch/MeTRIC/logs/hammer_finetune/%j.out
-#SBATCH --error=/oscar/home/jdosch/MeTRIC/logs/hammer_finetune/%j.out
+#SBATCH --output=/oscar/home/jdosch/MeTRIC/logs/%x/%j.out
+#SBATCH --error=/oscar/home/jdosch/MeTRIC/logs/%x/%j.out
 
 # =============================================================================
-# train_hammer_logdepth.sh -- variant of train_hammer.sh with two changes:
+# ABLATION LADDER 2/4 -- BRIDGE: HEAD injection + LoRA on decoder attention.
 #
-#   1. --loss.depth-log-space : the depth accuracy term runs on log-depth
-#      (|log pred - log gt| ~ relative error) instead of raw metres, so the far
-#      background stops dominating the L1 while the metric scale penalty is
-#      kept (this is NOT scale-invariant SILog). Near objects and far walls now
-#      contribute by RELATIVE error, weighted equally.
+#   injection = HEAD  (sparse depth injected post-KV-cache, into the depth
+#                      head's DPT fusion -- the control injection point)
+#   trainable = depth head + DepthConditioner + LoRA adapters on the decoder
+#               attention projections (Q/K/V/O, rank 16, alpha 32; base
+#               weights stay frozen)
 #
-#   2. --loss.depth-alpha 0.02 : low weight on the confidence regularizer
-#      (-alpha*log sigma). The 0.1 default let the confidence inflate and drove
-#      the training loss negative / the val loss up (see the 39c6... run) while
-#      AbsRel stayed ~0.055; a smaller alpha keeps the confidence term from
-#      swamping the accuracy signal. (conf ~ alpha/err, so lower alpha -> lower,
-#      better-behaved confidences.)
+# The de-confounding cell. It shares the injection point with the baseline and
+# the trainable set with the token arm, so:
+#   * vs train_hammer_headinject_headonly.sh -> PURE LoRA effect
+#     (injection fixed at HEAD, only decoder plasticity added).
+#   * vs train_hammer_tokeninject_lora.sh    -> PURE injection-point effect
+#     (trainable set fixed at LoRA+head, only HEAD->TOKEN changes).
+# Without this run, baseline-vs-token would confound "LoRA" with "token".
 #
-# Everything else is identical to train_hammer.sh: HEAD injection, depth head +
-# conditioner trainable, no LoRA. New --exp-group so the run gets its own config
-# hash / directory (the loss knobs are part of the experiment identity, so the
-# hash differs from the baseline run regardless).
+# ~2.5-3x the baseline's per-step cost (LoRA needs a decoder backward pass +
+# grad_checkpoint recompute); ~one SBATCH, under the 48h cap. Loss/epochs/seed
+# identical to every ladder arm.
 #
 # Run:
-#   sbatch /oscar/home/jdosch/MeTRIC/experiments/hammer_finetune/train_hammer_logdepth.sh
-#   bash   /oscar/home/jdosch/MeTRIC/experiments/hammer_finetune/train_hammer_logdepth.sh   # on an allocated GPU
+#   sbatch experiments/hammer_finetune/train_hammer_headinject_lora.sh
+#   bash   experiments/hammer_finetune/train_hammer_headinject_lora.sh  # allocated GPU
 # =============================================================================
 
 set -euo pipefail
@@ -52,16 +52,20 @@ mkdir -p "$REPO/logs"
 cd "$REPO/src"
 
 python finetune_depth.py \
-    --exp-group hammer_depth_cond_head_logdepth \
+    --exp-group hammer_sweep \
     \
     `# --- model / checkpointing -------------------------------------------` \
     --pretrained "$REPO/ckpt/checkpoints.pth" \
     --save-dir "$REPO/checkpoints" \
     \
-    `# --- conditioning arm: HEAD injection, depth head only (as baseline) --` \
+    `# --- conditioning arm: HEAD injection, LoRA on decoder + depth head --` \
+    `# --lora.enabled wraps the attention projections (defaults: targets`     \
+    `# Q/K/V/O, rank 16, alpha 32); train-heads DEPTH also unfreezes the`     \
+    `# depth head. Trainable = LoRA adapters + depth head + conditioner.`     \
     --depth-cond.injection HEAD \
     --depth-cond.heads DEPTH \
-    --lora.no-enabled \
+    --lora.enabled \
+    --lora.rank 16 \
     --train.train-heads DEPTH \
     \
     `# --- loss: log-depth accuracy term + low confidence-reg weight --------` \
@@ -85,7 +89,7 @@ python finetune_depth.py \
     `# --- optimization ------------------------------------------------------` \
     --batch-size 1 \
     --accum-iter 1 \
-    --epochs 10 \
+    --epochs 5 \
     --lr 1e-5 \
     --min-lr 1e-7 \
     --warmup-epochs 0.5 \

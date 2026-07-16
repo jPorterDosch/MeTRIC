@@ -180,10 +180,21 @@ class DepthOrPmapLoss(torch.nn.Module):
             # caller still backprops through the full summed loss. main =
             # confidence-weighted L1, grad = spatial-gradient/edge, reg =
             # -alpha*log(sigma) confidence regularizer. They sum to `total`.
+            #
+            # main_raw and conf DECOMPOSE main = conf-weight x error: main_raw is
+            # the sigma-FREE masked error (tracks true accuracy, should mirror
+            # AbsRel), conf is mean sigma (the weight). If main rises on val while
+            # main_raw stays flat, the overfit is confidence, not depth accuracy.
+            # Neither is in `total` (both detached, logging only).
+            vm = valid_mask[..., None].expand(-1, -1, -1, C)
+            main_raw = diff[vm].mean()
+            conf = sigma[valid_mask].mean()
             return total, {
                 "main": main_term.detach(),
                 "grad": grad_loss.detach(),
                 "reg": reg_loss.detach(),
+                "main_raw": main_raw.detach(),
+                "conf": conf.detach(),
             }
         return total
 
