@@ -763,6 +763,17 @@ def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     return pose.numpy() @ np.linalg.inv(k4)
 
 
+def _clip_dataset(views: list[dict], b: int) -> str:
+    """Dataset label of clip b (all views in a clip come from one scene, hence
+    one dataset). The collated 'dataset' field is a per-sample list/tuple; a
+    bare str covers the unbatched case. Lowercased so keys are consistent
+    regardless of loader casing (HAMMER_Multi emits 'hammer', ScanNet_Multi
+    'ScanNet')."""
+    d = views[0].get("dataset", "unknown")
+    label = d if isinstance(d, str) else d[b]
+    return str(label).lower()
+
+
 def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[float]]:
     """Sequence-level depth metrics for one batch: affine-invariant (one lstsq
     scale/shift over the whole clip) and metric (no-alignment) AbsRel /
@@ -770,7 +781,9 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
     whole-clip alignment is non-causal -- fine for the training-forward val
     pass; the streaming eval uses _streaming_depth_metrics instead.
     Returns PER-CLIP value lists (not batch means) so the caller's
-    accumulation weights every clip equally regardless of batch size."""
+    accumulation weights every clip equally regardless of batch size. Keys are
+    '<dataset>/<metric>' so a mixed-dataset val set yields per-dataset numbers
+    (the caller blends them for the overall figure)."""
     pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
 
     out: dict[str, list[float]] = {}
@@ -779,6 +792,7 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         mask = valid[b] & (gt[b] > 0)  # [S,H,W]
         if not mask.any():
             continue
+        ds = _clip_dataset(views, b)
         # the 3rd return is the aligned full-size prediction, reused for TAE
         res_affine, _, aligned, _ = depth_evaluation(
             pred[b], gt[b], custom_mask=mask, scale_and_shift=True
@@ -787,10 +801,10 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         res_metric, _, _, _ = depth_evaluation(
             pred[b], gt[b], custom_mask=mask, metric_scale=True
         )
-        out.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
-        out.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
-        out.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
-        out.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+        out.setdefault(f"{ds}/absrel_affine", []).append(res_affine["Abs Rel"])
+        out.setdefault(f"{ds}/delta1_affine", []).append(res_affine["delta < 1.25"])
+        out.setdefault(f"{ds}/absrel_metric", []).append(res_metric["Abs Rel"])
+        out.setdefault(f"{ds}/delta1_metric", []).append(res_metric["delta < 1.25"])
 
         aligned = aligned.reshape(S, H, W).numpy()
         mask_np = mask.numpy()
@@ -808,7 +822,7 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         ]
         errs = [e for e in errs if np.isfinite(e)]
         if errs:
-            out.setdefault("tae", []).append(float(np.mean(errs)))
+            out.setdefault(f"{ds}/tae", []).append(float(np.mean(errs)))
     return out
 
 
@@ -825,6 +839,7 @@ def _streaming_depth_metrics(
     out: dict[str, list[float]] = {}
     B, S, H, W = gt.shape
     for b in range(B):
+        ds = _clip_dataset(views, b)
         frame_stats: dict[str, list[float]] = {}
         errs: list[float] = []
         prev: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
@@ -839,9 +854,13 @@ def _streaming_depth_metrics(
                 pred[b, i], gt[b, i], custom_mask=mask, metric_scale=True
             )
             frame_stats.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
-            frame_stats.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
+            frame_stats.setdefault("delta1_affine", []).append(
+                res_affine["delta < 1.25"]
+            )
             frame_stats.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
-            frame_stats.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+            frame_stats.setdefault("delta1_metric", []).append(
+                res_metric["delta < 1.25"]
+            )
 
             cur = (
                 pred[b, i].numpy(),
@@ -854,16 +873,15 @@ def _streaming_depth_metrics(
                     errs.append(err)
             prev = cur
         for k, v in frame_stats.items():
-            out.setdefault(k, []).append(float(np.mean(v)))
+            out.setdefault(f"{ds}/{k}", []).append(float(np.mean(v)))
         if errs:
-            out.setdefault("tae", []).append(float(np.mean(errs)))
+            out.setdefault(f"{ds}/tae", []).append(float(np.mean(errs)))
     return out
 
 
-# the full depth-metric key set, in one canonical order. The per-batch dicts
-# are data-dependent (a rank can see a clip with no valid pixels or no finite
-# TAE pair), so cross-rank reductions must run over this fixed list -- never
-# over whatever keys happened to fire on one rank.
+# the depth metrics, in one canonical order. The per-dataset accumulator keys
+# are "<dataset>/<metric>"; the blended (dataset-agnostic) logged keys are just
+# "<metric>".
 _DEPTH_METRIC_KEYS = (
     "absrel_affine",
     "delta1_affine",
@@ -876,24 +894,49 @@ _DEPTH_METRIC_KEYS = (
 def _reduce_depth_metrics(
     sums: dict[str, float], counts: dict[str, int], accelerator: Accelerator
 ) -> dict[str, float]:
-    """Cross-rank mean of the depth-metric accumulators in ONE fixed-order
-    collective. Feeding the per-batch (data-dependent) keys through the
-    per-meter MetricLogger sync instead can pair mismatched meters across
-    ranks: an NCCL hang when key sets differ, silently mixed stats when only
-    the order does. Keys that never fired on any rank are omitted."""
+    """Cross-rank mean of the per-dataset depth-metric accumulators, plus a
+    dataset-blended value per metric. Input keys are "<dataset>/<metric>".
+
+    The reduced key set is UNIONED across ranks first: the accumulators are
+    data-dependent (a rank's shard may miss a whole dataset, or a metric that
+    never fired -- e.g. no finite TAE pair), so a per-rank key list would give
+    mismatched collective shapes and hang NCCL. Unioning yields one fixed order
+    every rank agrees on. Keys with zero global count are dropped.
+
+    Returns log-ready keys: "<dataset>_<metric>" (per dataset) and "<metric>"
+    (blended over datasets, count-weighted -- what checkpoint selection reads)."""
+    keys = sorted(set(sums) | set(counts))
+    if accelerator.num_processes > 1:
+        from accelerate.utils import gather_object
+
+        # [keys] per rank -> list of each rank's key list -> flatten to the union
+        keys = sorted({k for part in gather_object([keys]) for k in part})
+    if not keys:
+        return {}
+
     t = torch.tensor(
-        [[sums[k], counts[k]] for k in _DEPTH_METRIC_KEYS],
+        [[sums.get(k, 0.0), counts.get(k, 0)] for k in keys],
         dtype=torch.float64,
         device=accelerator.device,
     )
     if accelerator.num_processes > 1:
         accelerator.wait_for_everyone()
         accelerator.reduce(t, reduction="sum")
-    return {
-        k: (t[i, 0] / t[i, 1]).item()
-        for i, k in enumerate(_DEPTH_METRIC_KEYS)
-        if t[i, 1] > 0
-    }
+
+    out: dict[str, float] = {}
+    blended_sum: dict[str, float] = defaultdict(float)
+    blended_cnt: dict[str, float] = defaultdict(float)
+    for i, key in enumerate(keys):
+        s, c = t[i, 0].item(), t[i, 1].item()
+        dataset, metric = key.split("/", 1)
+        blended_sum[metric] += s
+        blended_cnt[metric] += c
+        if c > 0:
+            out[f"{dataset}_{metric}"] = s / c
+    for metric, c in blended_cnt.items():
+        if c > 0:
+            out[metric] = blended_sum[metric] / c
+    return out
 
 
 def _log_val_stats(
@@ -956,8 +999,8 @@ def val_loop(
     # and ResizedDataset its slot mapping from epoch + 777, so this yields the
     # identical clip set and order on every validation
     _set_data_epoch(data_loader, 0)
-    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
-    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    depth_sums: dict[str, float] = defaultdict(float)
+    depth_counts: dict[str, int] = defaultdict(int)
     glb_exported = 0
 
     # fork + fix the torch RNG: the sparse-conditioning masks (torch.rand) and
@@ -986,12 +1029,16 @@ def val_loop(
             for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
-            if args.export_glb:
+            # only the FINAL epoch's val pass writes GLBs -- a quick end-of-run
+            # sanity check, not one set per epoch (visualize_depth.py can render
+            # any checkpoint, incl. best, on demand). streaming_eval writes its
+            # own single set after training.
+            if args.export_glb and epoch == args.epochs - 1:
                 glb_exported += _export_eval_glbs(
                     result["views"],
                     result["pred"],
                     args.output_dir,
-                    tag=f"{prefix}_epoch{epoch}",
+                    tag=prefix,
                     accelerator=accelerator,
                     start_idx=glb_exported,
                     max_clips=args.export_glb_max_clips,
@@ -1030,8 +1077,8 @@ def streaming_eval(
     metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
     header = "Streaming eval:"
     _set_data_epoch(data_loader, 0)  # same epoch-0 pin as val_loop
-    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
-    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    depth_sums: dict[str, float] = defaultdict(float)
+    depth_counts: dict[str, int] = defaultdict(int)
     glb_exported = 0
 
     devices = [accelerator.device] if accelerator.device.type == "cuda" else []
