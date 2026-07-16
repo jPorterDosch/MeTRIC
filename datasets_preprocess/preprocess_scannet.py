@@ -1,19 +1,12 @@
 import argparse
-import random
-import gzip
-import json
 import os
 import os.path as osp
 
-import torch
-import PIL.Image
 from PIL import Image
 import numpy as np
 import cv2
 import multiprocessing
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import shutil
 import path_to_root  # noqa
 import datasets_preprocess.utils.cropping as cropping  # noqa
 
@@ -72,7 +65,9 @@ def process_scene(args):
 def main(rootdir, outdir):
     os.makedirs(outdir, exist_ok=True)
     splits = ["scans_test", "scans_train"]
-    pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+    # sched_getaffinity respects the slurm/cgroup CPU allocation;
+    # cpu_count() would oversubscribe a shared batch node
+    pool = multiprocessing.Pool(processes=len(os.sched_getaffinity(0)))
 
     for split in splits:
         scenes = [

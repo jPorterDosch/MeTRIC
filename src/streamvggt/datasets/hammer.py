@@ -27,11 +27,17 @@ class HAMMER_Multi(BaseMultiViewDataset):
         ROOT,
         max_interval=DEFAULT_MAX_INTERVAL,
         is_metric=True,
+        include_naked=False,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
+        # HAMMER ships each sceneX_trajY_Z with a sceneX_trajY_naked_Z twin: the
+        # SAME trajectory recaptured with the objects removed (empty table). That
+        # geometry is near-trivial and re-walks the object scene's background, so
+        # it is excluded by default; pass include_naked=True to keep it.
+        self.include_naked = include_naked
         if not isinstance(max_interval, int) or max_interval < 1:
             raise ValueError(
                 f"HAMMER max_interval must be a positive int, got {max_interval!r}"
@@ -57,7 +63,10 @@ class HAMMER_Multi(BaseMultiViewDataset):
                 f"(run datasets_preprocess/preprocess_hammer.py first)"
             )
         self.scenes = sorted(
-            scene for scene in os.listdir(self.scene_root) if scene.startswith("scene")
+            scene
+            for scene in os.listdir(self.scene_root)
+            if scene.startswith("scene")
+            and (self.include_naked or "_naked" not in scene)
         )
         if not self.scenes:
             raise ValueError(f"No HAMMER sequences found in {self.scene_root}")

@@ -67,6 +67,14 @@ INDEX_HTML = """<!doctype html>
   <label>point size <input id="size" type="range" min="1" max="8" step="0.5" value="2.5"></label>
   <button id="fit">fit view</button>
   <button id="bg">bg</button>
+  <span id="framectl" style="display:none; gap:6px; align-items:center;">
+    <button id="prev">&#9664;</button>
+    <input id="frame" type="range" min="0" max="0" step="1" value="0" style="width:160px">
+    <button id="next">&#9654;</button>
+    <button id="play">play</button>
+    <label><input id="accum" type="checkbox" checked> accumulate</label>
+    <span id="fnum" style="color:#aaa"></span>
+  </span>
   <span id="info"></span>
 </div>
 <script type="module">
@@ -93,8 +101,20 @@ controls.enableDamping = true;
 const loader = new GLTFLoader();
 let current = null;                 // currently displayed gltf.scene
 let pointMats = [];                  // point-cloud materials (for the size slider)
+let frameGroups = new Map();         // frame index -> [Object3D] (per-frame point clouds)
+let frameMax = -1;                   // highest frame index, or -1 if not a per-frame scene
+let playTimer = null;
 const sizeEl = document.getElementById('size');
 const infoEl = document.getElementById('info');
+const frameCtl = document.getElementById('framectl');
+const frameEl = document.getElementById('frame');
+const fnumEl = document.getElementById('fnum');
+const accumEl = document.getElementById('accum');
+
+function stopPlay() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  document.getElementById('play').textContent = 'play';
+}
 
 function clearCurrent() {
   if (!current) return;
@@ -104,6 +124,7 @@ function clearCurrent() {
     if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.dispose());
   });
   current = null; pointMats = [];
+  frameGroups = new Map(); frameMax = -1;
 }
 
 function fitView() {
@@ -123,6 +144,7 @@ function fitView() {
 }
 
 function load(name) {
+  stopPlay();
   infoEl.textContent = 'loading ' + name + ' ...';
   infoEl.classList.remove('err'); infoEl.id = 'info';
   loader.load(encodeURIComponent(name), (gltf) => {
@@ -140,14 +162,48 @@ function load(name) {
         pointMats.push(o.material);
         nPts += o.geometry.attributes.position.count;
       }
+      // per-frame point clouds are named frame_000, frame_001, ... by the
+      // exporter; group them so the slider can toggle frame visibility
+      const m = /^frame_(\\d+)/.exec(o.name || '');
+      if (m) {
+        const idx = parseInt(m[1], 10);
+        if (!frameGroups.has(idx)) frameGroups.set(idx, []);
+        frameGroups.get(idx).push(o);
+        if (idx > frameMax) frameMax = idx;
+      }
     });
     scene.add(current);
-    fitView();
+    fitView();  // fit once to the whole clip so stepping frames doesn't jump
     infoEl.textContent = nPts.toLocaleString() + ' points';
+    if (frameMax >= 0) {
+      frameEl.max = frameMax;
+      frameEl.value = frameMax;        // default: show all frames (accumulate)
+      frameCtl.style.display = 'inline-flex';
+      applyFrames();
+    } else {
+      frameCtl.style.display = 'none'; // fused/legacy scene: no per-frame nodes
+    }
   }, undefined, (e) => {
     infoEl.textContent = 'failed to load ' + name + ' (' + e + ')';
     infoEl.className = 'err';
   });
+}
+
+function applyFrames() {
+  if (frameMax < 0) return;
+  const k = parseInt(frameEl.value, 10);
+  const accumulate = accumEl.checked;
+  for (const [idx, objs] of frameGroups) {
+    const vis = accumulate ? idx <= k : idx === k;
+    objs.forEach(o => { o.visible = vis; });
+  }
+  fnumEl.textContent = 'frame ' + k + '/' + frameMax;
+}
+
+function stepFrame(delta) {
+  const k = Math.min(frameMax, Math.max(0, parseInt(frameEl.value, 10) + delta));
+  frameEl.value = k;
+  applyFrames();
 }
 
 sizeEl.addEventListener('input', () => {
@@ -158,6 +214,26 @@ document.getElementById('fit').addEventListener('click', fitView);
 document.getElementById('bg').addEventListener('click', () => {
   bgIdx = (bgIdx + 1) % bgColors.length;
   scene.background = new THREE.Color(bgColors[bgIdx]);
+});
+
+frameEl.addEventListener('input', () => { stopPlay(); applyFrames(); });
+accumEl.addEventListener('change', applyFrames);
+document.getElementById('prev').addEventListener('click', () => { stopPlay(); stepFrame(-1); });
+document.getElementById('next').addEventListener('click', () => { stopPlay(); stepFrame(1); });
+document.getElementById('play').addEventListener('click', (e) => {
+  if (playTimer) { stopPlay(); return; }
+  if (frameMax < 0) return;
+  e.target.textContent = 'stop';
+  playTimer = setInterval(() => {
+    const k = parseInt(frameEl.value, 10);
+    frameEl.value = k >= frameMax ? 0 : k + 1;
+    applyFrames();
+  }, 600);
+});
+window.addEventListener('keydown', (e) => {
+  if (frameMax < 0) return;
+  if (e.key === 'ArrowRight') { stopPlay(); stepFrame(1); }
+  else if (e.key === 'ArrowLeft') { stopPlay(); stepFrame(-1); }
 });
 
 const fileEl = document.getElementById('file');

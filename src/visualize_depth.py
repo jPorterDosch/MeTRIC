@@ -24,19 +24,24 @@ import argparse
 import os
 from pathlib import Path
 
+import matplotlib
+import numpy as np
 import torch
+import trimesh
 from accelerate import Accelerator
 
 from dust3r.inference import loss_of_one_batch  # noqa
 from finetune_depth import (
     FinetuneDepthCfg,
-    _export_eval_glbs,
+    _clip_predictions,
     _prepare_batch,
     _set_data_epoch,
+    _stack_depth_batch,
     build_model,
     build_train_loader,
 )
 from streamvggt.datasets import MultiDatasetConfig, Split
+from visual_util import apply_scene_alignment, integrate_camera_into_scene
 from streamvggt.depth_cond import (
     DepthCondCfg,
     EncoderCacheCfg,
@@ -150,6 +155,63 @@ def _clip_confidences(preds: list[dict]) -> list[tuple[float, float, float]]:
     ]
 
 
+def _per_frame_scene(predictions: dict) -> trimesh.Scene:
+    """Build a GLB scene whose per-frame point clouds are SEPARATE, named
+    geometries ("frame_000", "frame_001", ...) instead of one fused cloud, so
+    the viewer can show/step through frames individually. Cameras for every
+    frame are always added (they trace the trajectory). Same world alignment as
+    predictions_to_glb (aligned to frame 0), so frames overlay consistently.
+
+    `predictions` is the dict _clip_predictions returns: world_points_from_depth
+    [S,H,W,3], depth_conf [S,H,W] (0/1 valid mask here), images [S,3,H,W] in
+    [0,1], extrinsic [S,3,4] world->cam."""
+    world = predictions["world_points_from_depth"]  # [S,H,W,3]
+    conf = predictions["depth_conf"]  # [S,H,W]
+    images = predictions["images"]
+    extr = predictions["extrinsic"]  # [S,3,4] world->cam
+    S = world.shape[0]
+
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW -> NHWC
+        colors = np.transpose(images, (0, 2, 3, 1))
+    else:
+        colors = images
+
+    extrinsics_4x4 = np.zeros((S, 4, 4), dtype=np.float32)
+    extrinsics_4x4[:, :3, :4] = extr
+    extrinsics_4x4[:, 3, 3] = 1.0
+
+    # one global scene scale (from all kept points) so camera markers are sized
+    # consistently and the view does not rescale as frames toggle
+    kept_all = world.reshape(-1, 3)[conf.reshape(-1) > 1e-5]
+    if kept_all.size:
+        lo = np.percentile(kept_all, 5, axis=0)
+        hi = np.percentile(kept_all, 95, axis=0)
+        scene_scale = float(np.linalg.norm(hi - lo)) or 1.0
+    else:
+        scene_scale = 1.0
+
+    colormap = matplotlib.colormaps.get_cmap("gist_rainbow")
+    scene = trimesh.Scene()
+    for i in range(S):
+        mask = conf[i].reshape(-1) > 1e-5
+        verts = world[i].reshape(-1, 3)[mask]
+        cols = (colors[i].reshape(-1, 3)[mask] * 255).astype(np.uint8)
+        if verts.size:
+            # geom_name -> node name -> three.js object.name (the viewer keys
+            # its frame slider off the "frame_NNN" prefix)
+            scene.add_geometry(
+                trimesh.PointCloud(vertices=verts, colors=cols),
+                geom_name=f"frame_{i:03d}",
+            )
+        rgba = colormap(i / max(S, 1))
+        color = tuple(int(255 * x) for x in rgba[:3])
+        integrate_camera_into_scene(
+            scene, np.linalg.inv(extrinsics_4x4[i]), color, scene_scale
+        )
+
+    return apply_scene_alignment(scene, extrinsics_4x4)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -164,7 +226,27 @@ def main() -> None:
         help="which checkpoint to load from a weights dir (default: auto)",
     )
     ap.add_argument(
-        "--num-clips", type=int, default=4, help="how many val clips to export"
+        "--num-clips", type=int, default=4, help="how many val clips (scenes) to export"
+    )
+    ap.add_argument(
+        "--num-views",
+        type=int,
+        default=None,
+        help="frames per scene; overrides the saved val config (default: as trained, "
+        "typically 4). Use e.g. --num-clips 1 --num-views 32 for one long scene.",
+    )
+    ap.add_argument(
+        "--base",
+        action="store_true",
+        help="visualize the BASE model (pretrained weights in the same architecture, "
+        "conditioner/LoRA at init) instead of the finetuned checkpoint. Files are "
+        "tagged base_* vs finetuned_* so both can share one --out-dir for A/B.",
+    )
+    ap.add_argument(
+        "--pretrained",
+        default=None,
+        help="base checkpoint for --base (default: the pretrained path saved in the "
+        "run's config; pass explicitly if that relative path does not resolve here).",
     )
     ap.add_argument(
         "--out-dir",
@@ -192,7 +274,13 @@ def main() -> None:
     raw = load_saved_args(ckpt)
     mcfg = rebuild_metric_cfg(raw)
     val_ds = rebuild_val_dataset(raw, args.data_root)
+    if args.num_views is not None:
+        # more frames per scene -> longer sequences to scrub. num_views is
+        # independent of resolution; the sampler and streaming path handle any
+        # S (bounded by sequence length / GPU memory).
+        val_ds.num_views = args.num_views
 
+    mode = "base" if args.base else "finetuned"
     out_dir = args.out_dir or str(
         (ckpt_path.parent if ckpt_path.parent != Path("") else Path(".")) / "viz"
     )
@@ -202,13 +290,26 @@ def main() -> None:
     # build_train_loader reads val_dataset/num_workers/fixed_length. The rest
     # keep their defaults (train_dataset/loss are never touched -- we only
     # build the TEST loader and never run the criterion).
+    # --base loads pretrained weights into the same architecture (conditioner /
+    # LoRA at their zero-init, so it reproduces the pretrained model's behavior
+    # -- the baseline the finetuning improves on).
+    pretrained_path = ""
+    if args.base:
+        pretrained_path = args.pretrained or raw.get("pretrained") or ""
+        if not pretrained_path or not os.path.exists(pretrained_path):
+            raise SystemExit(
+                "--base needs a valid pretrained checkpoint. The path saved in the "
+                f"run config was {raw.get('pretrained')!r} (unresolved from here); "
+                "pass --pretrained /abs/path/to/base_checkpoint.pth."
+            )
+
     cfg = FinetuneDepthCfg(
         depth_cond=mcfg.depth_cond,
         lora=mcfg.lora,
         encoder_cache=mcfg.encoder_cache,
         train=mcfg.train,
         val_dataset=val_ds,
-        pretrained="",  # weights come from the finetuned checkpoint below
+        pretrained=pretrained_path,  # only used in --base; else weights load below
         resume=None,
         num_workers=args.num_workers,
         batch_size=1,  # streaming inference needs one clip at a time
@@ -222,16 +323,24 @@ def main() -> None:
     device = accelerator.device
 
     # build_model applies LoRA + freezes (harmless for eval) so the module key
-    # layout matches the saved state_dict; load_pretrained=False because the
-    # finetuned weights below supersede the base checkpoint.
-    model, _ = build_model(cfg, mcfg, device, load_pretrained=False)
-    state_dict = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
-    model.load_state_dict(state_dict, strict=True)
+    # layout matches the saved state_dict.
+    if args.base:
+        # load_pretrained=True folds the base StreamVGGT weights in; no
+        # finetuned state_dict is applied on top.
+        print(f"BASE model: loading pretrained weights {pretrained_path}")
+        model, _ = build_model(cfg, mcfg, device, load_pretrained=True)
+    else:
+        model, _ = build_model(cfg, mcfg, device, load_pretrained=False)
+        state_dict = {k.replace("module.", ""): v for k, v in ckpt["model"].items()}
+        model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     loader = build_train_loader(cfg, Split.TEST, accelerator, batch_size=1)
     loader = accelerator.prepare(loader)
     _set_data_epoch(loader, 0)  # deterministic clip set/order (see val_loop)
+
+    glb_dir = os.path.join(out_dir, "glb")
+    os.makedirs(glb_dir, exist_ok=True)
 
     exported = 0
     with torch.no_grad():
@@ -255,28 +364,28 @@ def main() -> None:
                 symmetrize_batch=False,
                 use_amp=True,
             )
-            # per-clip confidence before export; confs[j] lines up with the
-            # j-th clip _export_eval_glbs writes (both iterate b in order)
-            confs = _clip_confidences(result["pred"])
-            n = _export_eval_glbs(
-                result["views"],
-                result["pred"],
-                out_dir,
-                tag="viz",
-                accelerator=accelerator,
-                start_idx=exported,
-                max_clips=args.num_clips,
-            )
-            for j in range(n):
-                mean_c, min_c, max_c = confs[j]
-                print(
-                    f"  clip {exported + j}: mean depth confidence {mean_c:.4f} "
-                    f"(min {min_c:.4f}, max {max_c:.4f})"
+            views, preds = result["views"], result["pred"]
+            confs = _clip_confidences(preds)
+            # imgs is not in _stack_depth_batch; stack it the same way
+            imgs = torch.stack([v["img"] for v in views], dim=1).float().cpu()
+            pred, _, valid, K, pose = _stack_depth_batch(views, preds)
+            for b in range(pred.shape[0]):
+                if exported >= args.num_clips:
+                    break
+                predictions = _clip_predictions(
+                    imgs[b], pred[b], valid[b], K[b], pose[b]
                 )
-            exported += n
+                scene = _per_frame_scene(predictions)
+                scene.export(os.path.join(glb_dir, f"{mode}_clip{exported}.glb"))
+                mean_c, min_c, max_c = confs[b]
+                print(
+                    f"  [{mode}] clip {exported}: {pred.shape[1]} frames | mean depth "
+                    f"confidence {mean_c:.4f} (min {min_c:.4f}, max {max_c:.4f})"
+                )
+                exported += 1
             del result, batch
 
-    print(f"Wrote {exported} .glb file(s) to {os.path.join(out_dir, 'glb')}")
+    print(f"Wrote {exported} .glb file(s) to {glb_dir}")
 
 
 if __name__ == "__main__":

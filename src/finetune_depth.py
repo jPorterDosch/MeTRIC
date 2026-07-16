@@ -463,12 +463,18 @@ def run(
                 args=args,
                 mcfg=mcfg,
             )
-            # select on the AVG, not the median: SmoothedValue syncs only
-            # count/total across ranks, so global_avg is global while median
-            # stays rank-local -- under DDP a median-based decision would use
-            # rank 0's shard only and best_so_far would diverge across ranks
-            if val_stats["loss_avg"] < best_so_far:
-                best_so_far = val_stats["loss_avg"]
+            # Select "best" on metric AbsRel, NOT the criterion loss. The
+            # confidence-regularized loss (-alpha*log sigma) is not monotonic
+            # with depth quality: it can keep falling as the confidence inflates
+            # while AbsRel plateaus/worsens, so selecting on loss_avg pinned
+            # "best" to the earliest epoch. absrel_metric_avg (metric-scale,
+            # lower is better) tracks the actual objective and is already
+            # globally reduced across ranks (_reduce_depth_metrics), so it needs
+            # no median/avg caveat. Fall back to loss_avg only if the metric
+            # never fired on any rank (e.g. a val pass with no valid GT pixels).
+            selection = val_stats.get("absrel_metric_avg", val_stats["loss_avg"])
+            if selection < best_so_far:
+                best_so_far = selection
                 save_model(epoch, "best", best_so_far, args.start_step)
 
     total_time = time.time() - start_time

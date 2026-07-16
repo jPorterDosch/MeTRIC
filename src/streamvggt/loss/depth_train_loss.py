@@ -17,12 +17,18 @@ class DepthTrainLoss(MultiLoss):
         reduction: str = "batch-based",
         diff_depth_th: float = 0.05,
         metric: bool = False,
+        log_space: bool = False,
     ) -> None:
         super().__init__()
         # metric=True supervises absolute depth end-to-end: the depth term skips
         # its scale/shift alignment and the temporal term skips its scale fit, so
         # the metric scale the model is conditioned on is actually penalized.
         self.metric = metric
+        # log_space=True runs the depth ACCURACY term (DepthOrPmapLoss) on
+        # log-depth so error is relative, not absolute metres -- the far
+        # background stops dominating. The temporal term is left in linear depth
+        # (it already masks to near-static pixels via diff_depth_th).
+        self.log_space = log_space
         self.temporal_loss = TemporalGradientMatchingLoss(
             trim=trim,
             temp_grad_scales=temp_grad_scales,
@@ -30,7 +36,9 @@ class DepthTrainLoss(MultiLoss):
             reduction=reduction,
             diff_depth_th=diff_depth_th,
         )
-        self.depth_loss = DepthOrPmapLoss(alpha=alpha, metric=metric)
+        self.depth_loss = DepthOrPmapLoss(
+            alpha=alpha, metric=metric, log_space=log_space
+        )
 
         if weights is None:
             # equal weight per objective (temporal, depth) when none supplied
