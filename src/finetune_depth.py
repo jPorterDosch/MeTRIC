@@ -821,7 +821,7 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         aligned = aligned.reshape(S, H, W).numpy()
         mask_np = mask.numpy()
         i2l = [_img2lidar(K[b, i], pose[b, i]) for i in range(S)]
-        errs = [
+        pairs = [
             tae(
                 aligned[i],
                 mask_np[i],
@@ -832,9 +832,15 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
             )
             for i in range(S - 1)
         ]
-        errs = [e for e in errs if np.isfinite(e)]
-        if errs:
-            out.setdefault(f"{ds}/tae", []).append(float(np.mean(errs)))
+        # tae -> (mean-abs, mean-sq) of the relative frame-to-frame error; tae_sq
+        # is the spike-sensitive squared companion (finiteness of the two
+        # coincides, but filter each independently to be safe).
+        abs_errs = [a for a, _ in pairs if np.isfinite(a)]
+        sq_errs = [s for _, s in pairs if np.isfinite(s)]
+        if abs_errs:
+            out.setdefault(f"{ds}/tae", []).append(float(np.mean(abs_errs)))
+        if sq_errs:
+            out.setdefault(f"{ds}/tae_sq", []).append(float(np.mean(sq_errs)))
     return out
 
 
@@ -854,6 +860,7 @@ def _streaming_depth_metrics(
         ds = _clip_dataset(views, b)
         frame_stats: dict[str, list[float]] = {}
         errs: list[float] = []
+        sq_errs: list[float] = []
         prev: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         for i in range(S):
             mask = valid[b, i] & (gt[b, i] > 0)  # [H,W]
@@ -883,14 +890,18 @@ def _streaming_depth_metrics(
                 _img2lidar(K[b, i], pose[b, i]),
             )
             if prev is not None:
-                err = tae(*prev, *cur)
+                err, err_sq = tae(*prev, *cur)
                 if np.isfinite(err):
                     errs.append(err)
+                if np.isfinite(err_sq):
+                    sq_errs.append(err_sq)
             prev = cur
         for k, v in frame_stats.items():
             out.setdefault(f"{ds}/{k}", []).append(float(np.mean(v)))
         if errs:
             out.setdefault(f"{ds}/tae", []).append(float(np.mean(errs)))
+        if sq_errs:
+            out.setdefault(f"{ds}/tae_sq", []).append(float(np.mean(sq_errs)))
     return out
 
 
@@ -900,9 +911,12 @@ def _streaming_depth_metrics(
 _DEPTH_METRIC_KEYS = (
     "absrel_affine",
     "delta1_affine",
+    "rmse_affine",
     "absrel_metric",
     "delta1_metric",
+    "rmse_metric",
     "tae",
+    "tae_sq",
 )
 
 
