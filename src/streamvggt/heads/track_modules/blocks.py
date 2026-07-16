@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils import bilinear_sampler
-from .modules import Mlp, AttnBlock, CrossAttnBlock, ResidualBlock
+from .modules import AttnBlock, CrossAttnBlock
 
 
 class EfficientUpdateFormer(nn.Module):
@@ -41,7 +41,9 @@ class EfficientUpdateFormer(nn.Module):
         self.num_virtual_tracks = num_virtual_tracks
 
         if self.add_space_attn:
-            self.virual_tracks = nn.Parameter(torch.randn(1, num_virtual_tracks, 1, hidden_size))
+            self.virual_tracks = nn.Parameter(
+                torch.randn(1, num_virtual_tracks, 1, hidden_size)
+            )
         else:
             self.virual_tracks = None
 
@@ -70,10 +72,20 @@ class EfficientUpdateFormer(nn.Module):
                 ]
             )
             self.space_point2virtual_blocks = nn.ModuleList(
-                [CrossAttnBlock(hidden_size, hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(space_depth)]
+                [
+                    CrossAttnBlock(
+                        hidden_size, hidden_size, num_heads, mlp_ratio=mlp_ratio
+                    )
+                    for _ in range(space_depth)
+                ]
             )
             self.space_virtual2point_blocks = nn.ModuleList(
-                [CrossAttnBlock(hidden_size, hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(space_depth)]
+                [
+                    CrossAttnBlock(
+                        hidden_size, hidden_size, num_heads, mlp_ratio=mlp_ratio
+                    )
+                    for _ in range(space_depth)
+                ]
             )
             assert len(self.time_blocks) >= len(self.space_virtual2point_blocks)
         self.initialize_weights()
@@ -110,17 +122,27 @@ class EfficientUpdateFormer(nn.Module):
             time_tokens = self.time_blocks[i](time_tokens)
 
             tokens = time_tokens.view(B, N, T, -1)  # (B N) T C -> B N T C
-            if self.add_space_attn and (i % (len(self.time_blocks) // len(self.space_virtual_blocks)) == 0):
-                space_tokens = tokens.permute(0, 2, 1, 3).contiguous().view(B * T, N, -1)  # B N T C -> (B T) N C
+            if self.add_space_attn and (
+                i % (len(self.time_blocks) // len(self.space_virtual_blocks)) == 0
+            ):
+                space_tokens = (
+                    tokens.permute(0, 2, 1, 3).contiguous().view(B * T, N, -1)
+                )  # B N T C -> (B T) N C
                 point_tokens = space_tokens[:, : N - self.num_virtual_tracks]
                 virtual_tokens = space_tokens[:, N - self.num_virtual_tracks :]
 
-                virtual_tokens = self.space_virtual2point_blocks[j](virtual_tokens, point_tokens, mask=mask)
+                virtual_tokens = self.space_virtual2point_blocks[j](
+                    virtual_tokens, point_tokens, mask=mask
+                )
                 virtual_tokens = self.space_virtual_blocks[j](virtual_tokens)
-                point_tokens = self.space_point2virtual_blocks[j](point_tokens, virtual_tokens, mask=mask)
+                point_tokens = self.space_point2virtual_blocks[j](
+                    point_tokens, virtual_tokens, mask=mask
+                )
 
                 space_tokens = torch.cat([point_tokens, virtual_tokens], dim=1)
-                tokens = space_tokens.view(B, T, N, -1).permute(0, 2, 1, 3)  # (B T) N C -> B N T C
+                tokens = space_tokens.view(B, T, N, -1).permute(
+                    0, 2, 1, 3
+                )  # (B T) N C -> B N T C
                 j += 1
 
         if self.add_space_attn:
@@ -136,7 +158,14 @@ class EfficientUpdateFormer(nn.Module):
 
 
 class CorrBlock:
-    def __init__(self, fmaps, num_levels=4, radius=4, multiple_track_feats=False, padding_mode="zeros"):
+    def __init__(
+        self,
+        fmaps,
+        num_levels=4,
+        radius=4,
+        multiple_track_feats=False,
+        padding_mode="zeros",
+    ):
         """
         Build a pyramid of feature maps from the input.
 
@@ -171,8 +200,10 @@ class CorrBlock:
         r = self.radius
         dx = torch.linspace(-r, r, 2 * r + 1, device=fmaps.device, dtype=fmaps.dtype)
         dy = torch.linspace(-r, r, 2 * r + 1, device=fmaps.device, dtype=fmaps.dtype)
-        # delta: for every (dy,dx) displacement (i.e. Δx, Δy)
-        self.delta = torch.stack(torch.meshgrid(dy, dx, indexing="ij"), dim=-1)  # shape: (2r+1, 2r+1, 2)
+        # delta: for every (dy,dx) displacement (i.e. delta x, delta y)
+        self.delta = torch.stack(
+            torch.meshgrid(dy, dx, indexing="ij"), dim=-1
+        )  # shape: (2r+1, 2r+1, 2)
 
     def corr_sample(self, targets, coords):
         """
@@ -200,7 +231,9 @@ class CorrBlock:
             # fmap2s: (B, S, C, H*W)
             fmap2s = fmaps.view(B, S, C, H * W)
             # Choose appropriate target features.
-            fmap1 = targets_split[i] if self.multiple_track_feats else targets  # shape: (B, S, N, C)
+            fmap1 = (
+                targets_split[i] if self.multiple_track_feats else targets
+            )  # shape: (B, S, N, C)
 
             # Compute correlation directly
             corrs = compute_corr_level(fmap1, fmap2s, C)
@@ -213,15 +246,21 @@ class CorrBlock:
             delta_lvl = self.delta.to(coords.device).to(coords.dtype)
             # Now the grid for grid_sample is:
             # coords_lvl = centroid_lvl + delta_lvl   (broadcasted over grid)
-            coords_lvl = centroid_lvl + delta_lvl.view(1, 2 * self.radius + 1, 2 * self.radius + 1, 2)
+            coords_lvl = centroid_lvl + delta_lvl.view(
+                1, 2 * self.radius + 1, 2 * self.radius + 1, 2
+            )
 
             # Sample from the correlation volume using bilinear interpolation.
             # We reshape corrs to (B * S * N, 1, H, W) so grid_sample acts over each target.
             corrs_sampled = bilinear_sampler(
-                corrs.reshape(B * S * N, 1, H, W), coords_lvl, padding_mode=self.padding_mode
+                corrs.reshape(B * S * N, 1, H, W),
+                coords_lvl,
+                padding_mode=self.padding_mode,
             )
             # The sampled output is (B * S * N, 1, 2r+1, 2r+1). Flatten the last two dims.
-            corrs_sampled = corrs_sampled.view(B, S, N, -1)  # Now shape: (B, S, N, (2r+1)^2)
+            corrs_sampled = corrs_sampled.view(
+                B, S, N, -1
+            )  # Now shape: (B, S, N, (2r+1)^2)
             out_pyramid.append(corrs_sampled)
 
         # Concatenate all levels along the last dimension.
@@ -233,5 +272,7 @@ def compute_corr_level(fmap1, fmap2s, C):
     # fmap1: (B, S, N, C)
     # fmap2s: (B, S, C, H*W)
     corrs = torch.matmul(fmap1, fmap2s)  # (B, S, N, H*W)
-    corrs = corrs.view(fmap1.shape[0], fmap1.shape[1], fmap1.shape[2], -1)  # (B, S, N, H*W)
+    corrs = corrs.view(
+        fmap1.shape[0], fmap1.shape[1], fmap1.shape[2], -1
+    )  # (B, S, N, H*W)
     return corrs / math.sqrt(C)

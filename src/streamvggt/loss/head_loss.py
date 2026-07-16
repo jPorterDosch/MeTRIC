@@ -37,7 +37,13 @@ class CameraLoss(torch.nn.Module):
 
 
 class DepthOrPmapLoss(torch.nn.Module):
-    def __init__(self, alpha: float = 0.01, metric: bool = False) -> None:
+    def __init__(
+        self,
+        alpha: float = 0.01,
+        metric: bool = False,
+        log_space: bool = False,
+        log_eps: float = 1e-3,
+    ) -> None:
         super().__init__()
         self.alpha = alpha
         self.grad_scales = 3
@@ -48,6 +54,15 @@ class DepthOrPmapLoss(torch.nn.Module):
         # is conditioned on real metric depth). metric=False keeps the default
         # scale-and-shift-invariant behavior.
         self.metric = metric
+        # log_space=True computes the accuracy AND gradient terms on log-depth,
+        # so |log pred - log gt| ~ |pred-gt|/gt (relative error). This stops the
+        # far background from dominating the metric L1 while KEEPING the scale
+        # penalty (a wrong global scale is a constant log offset -- unlike
+        # scale-invariant SILog, which subtracts the mean and would discard the
+        # metric signal this model is conditioned for). Depth-head only (the
+        # log is on the [B,H,W,1] depth, not the pointmap branch).
+        self.log_space = log_space
+        self.log_eps = log_eps
 
     def gradient_loss_multi_scale(
         self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor | None = None
@@ -113,7 +128,8 @@ class DepthOrPmapLoss(torch.nn.Module):
         sigma_p: torch.Tensor | None = None,
         sigma_g: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.metric:
             # Metric supervision: compare raw predicted depth against raw GT,
             # with no normalization or scale/shift fit, so absolute scale is
@@ -132,7 +148,19 @@ class DepthOrPmapLoss(torch.nn.Module):
             sigma_g = sigma_g.clamp(min=1e-6)
         # sigma = 0.5 * (sigma_p + sigma_g)
         sigma = sigma_p
-        diff = (pred_aligned - gt_normalized).abs()
+
+        # compare in log-depth (relative, scale-aware) when requested. clamp
+        # keeps the log finite where pred is <=0 (the inv_log head can emit
+        # small negatives) or gt is 0 (invalid); those pixels are dropped by
+        # valid_mask before the mean, and the clamp only stops NaN/inf from
+        # leaking through the masked gradient product.
+        if self.log_space and pred.shape[-1] == 1:
+            pred_cmp = torch.log(pred_aligned.clamp(min=self.log_eps))
+            gt_cmp = torch.log(gt_normalized.clamp(min=self.log_eps))
+        else:
+            pred_cmp, gt_cmp = pred_aligned, gt_normalized
+
+        diff = (pred_cmp - gt_cmp).abs()
 
         C = diff.shape[-1]
 
@@ -141,16 +169,34 @@ class DepthOrPmapLoss(torch.nn.Module):
         ].mean()
 
         if pred.shape[-1] == 1:
-            grad_loss = self.image_gradient_loss(
-                pred_aligned, gt_normalized, valid_mask
-            )
+            grad_loss = self.image_gradient_loss(pred_cmp, gt_cmp, valid_mask)
         else:
-            grad_loss = self.gradient_loss_multi_scale(
-                pred_aligned, gt_normalized, valid_mask
-            )
+            grad_loss = self.gradient_loss_multi_scale(pred_cmp, gt_cmp, valid_mask)
         reg_loss = -self.alpha * torch.log(sigma.clamp(min=1e-6))[valid_mask].mean()
-        # return main + reg
-        return self.gamma * main_loss + grad_loss + reg_loss
+        main_term = self.gamma * main_loss
+        total = main_term + grad_loss + reg_loss
+        if return_components:
+            # detached copies for logging only; `total` keeps its graph so the
+            # caller still backprops through the full summed loss. main =
+            # confidence-weighted L1, grad = spatial-gradient/edge, reg =
+            # -alpha*log(sigma) confidence regularizer. They sum to `total`.
+            #
+            # main_raw and conf DECOMPOSE main = conf-weight x error: main_raw is
+            # the sigma-FREE masked error (tracks true accuracy, should mirror
+            # AbsRel), conf is mean sigma (the weight). If main rises on val while
+            # main_raw stays flat, the overfit is confidence, not depth accuracy.
+            # Neither is in `total` (both detached, logging only).
+            vm = valid_mask[..., None].expand(-1, -1, -1, C)
+            main_raw = diff[vm].mean()
+            conf = sigma[valid_mask].mean()
+            return total, {
+                "main": main_term.detach(),
+                "grad": grad_loss.detach(),
+                "reg": reg_loss.detach(),
+                "main_raw": main_raw.detach(),
+                "conf": conf.detach(),
+            }
+        return total
 
 
 class TrackLoss(torch.nn.Module):

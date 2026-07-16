@@ -105,7 +105,7 @@ def resolve_output_dir(cfg: FinetuneDepthCfg, run_id: str) -> str:
     current id instead would silently fork the resumed run into a fresh
     directory, splitting one logical run across two dirs / wandb runs.
 
-    Fresh run: <save_dir>/<exp_name>_<run_id>, failing fast if it already exists
+    Fresh run: <save_dir>/<exp_group>/<run_id>, failing fast if it already exists
     (an experiment with this exact config has been run or is running, and
     silently re-running it would waste the compute). Only rank 0 performs the
     existence check: under multi-process launch the non-zero ranks start later
@@ -113,7 +113,7 @@ def resolve_output_dir(cfg: FinetuneDepthCfg, run_id: str) -> str:
     """
     if cfg.resume:
         return os.path.dirname(os.path.abspath(cfg.resume))
-    output_dir = os.path.join(cfg.save_dir, f"{cfg.exp_name}_{run_id}")
+    output_dir = os.path.join(cfg.save_dir, cfg.exp_group, run_id)
     if not is_rank_zero():
         return output_dir
     if os.path.exists(output_dir):

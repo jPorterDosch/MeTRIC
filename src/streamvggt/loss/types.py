@@ -124,6 +124,12 @@ class LossConfig:
     # the depth and temporal terms. On by default because DEPTH_TRAIN targets
     # metric-depth-conditioned training; only DEPTH_TRAIN consumes this field.
     depth_metric: bool = True
+    # Run the depth accuracy term on log-depth (|log pred - log gt|, relative &
+    # scale-aware) instead of raw metres, so the far background stops dominating
+    # the L1. Keeps the metric scale penalty (unlike scale-invariant SILog).
+    # Retune depth_alpha when enabling: residuals shrink to ~relative units, so
+    # the confidence scale (conf ~ alpha/err) shifts. Only DEPTH_TRAIN uses it.
+    depth_log_space: bool = False
 
     # Regr3DPose / Regr3DPose_ScaleInv knobs.
     norm_mode: str = "?avg_dis"
@@ -181,6 +187,7 @@ class LossConfig:
                     reduction=self.reduction,
                     diff_depth_th=self.diff_depth_th,
                     metric=self.depth_metric,
+                    log_space=self.depth_log_space,
                 )
 
             case Recipe.DISTILL:

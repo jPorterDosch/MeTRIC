@@ -88,6 +88,11 @@ class DatasetConfig:
     scenes the lowres loader excludes (fails fast if missing). ``None`` falls
     back to the original DUSt3R convention of deriving ``ROOT + "_highres"``
     and silently skipping exclusion when that tree is absent."""
+    include_naked: bool = False
+    """HAMMER only: keep the ``*_naked`` sequences (each object scene's
+    empty-table recapture along the same trajectory -- near-duplicate, trivial
+    geometry). Default ``False`` drops them (23/46 train, 9/18 test). A no-op
+    for the other datasets, which have no naked twins."""
 
     def validate(self) -> "DatasetConfig":
         """Coerce plain strings to enum members and fail fast on any
@@ -154,7 +159,7 @@ class DatasetConfig:
         )
         match self.dataset:
             case DatasetName.HAMMER:
-                dataset = HAMMER_Multi(**kwargs)
+                dataset = HAMMER_Multi(include_naked=self.include_naked, **kwargs)
             case DatasetName.ARKITSCENES_LOWRES:
                 dataset = ARKitScenes_Multi(
                     highres_root=(
@@ -238,6 +243,10 @@ class MultiDatasetConfig:
     nneg: int = 0
     transform: TransformName = TransformName.IMGNORM
     seed: Optional[int] = None
+    include_naked: bool = False
+    """HAMMER only: keep the ``*_naked`` empty-table sequences (default ``False``
+    drops them). Shared across the mixture; a no-op for datasets without naked
+    twins."""
 
     def validate(self) -> "MultiDatasetConfig":
         """Fail fast on parallel-tuple length mismatches; per-dataset field
@@ -287,6 +296,7 @@ class MultiDatasetConfig:
                 highres_root=(
                     None if self.highres_root is None else self.highres_root[i]
                 ),
+                include_naked=self.include_naked,
             )
             if i == 0:
                 # a DatasetConfig knob this fan-out does not pass would

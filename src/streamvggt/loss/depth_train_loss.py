@@ -17,12 +17,18 @@ class DepthTrainLoss(MultiLoss):
         reduction: str = "batch-based",
         diff_depth_th: float = 0.05,
         metric: bool = False,
+        log_space: bool = False,
     ) -> None:
         super().__init__()
         # metric=True supervises absolute depth end-to-end: the depth term skips
         # its scale/shift alignment and the temporal term skips its scale fit, so
         # the metric scale the model is conditioned on is actually penalized.
         self.metric = metric
+        # log_space=True runs the depth ACCURACY term (DepthOrPmapLoss) on
+        # log-depth so error is relative, not absolute metres -- the far
+        # background stops dominating. The temporal term is left in linear depth
+        # (it already masks to near-static pixels via diff_depth_th).
+        self.log_space = log_space
         self.temporal_loss = TemporalGradientMatchingLoss(
             trim=trim,
             temp_grad_scales=temp_grad_scales,
@@ -30,7 +36,9 @@ class DepthTrainLoss(MultiLoss):
             reduction=reduction,
             diff_depth_th=diff_depth_th,
         )
-        self.depth_loss = DepthOrPmapLoss(alpha=alpha, metric=metric)
+        self.depth_loss = DepthOrPmapLoss(
+            alpha=alpha, metric=metric, log_space=log_space
+        )
 
         if weights is None:
             # equal weight per objective (temporal, depth) when none supplied
@@ -78,20 +86,35 @@ class DepthTrainLoss(MultiLoss):
 
         # ---------- Ldepth ----------
         depth_terms = []
-        for g, p in zip(gts, preds):
+        # per-frame breakdown of Ldepth for logging: main (confidence-weighted
+        # L1), grad (spatial-gradient/edge), reg (-alpha*log(sigma) confidence
+        # regularizer) -- these three sum to Ldepth. main_raw (sigma-free error)
+        # and conf (mean sigma) are diagnostics that DECOMPOSE main = conf*error
+        # (not summands); they separate an accuracy overfit from a confidence
+        # overfit when main climbs on val.
+        comp_terms: dict[str, list[torch.Tensor]] = {
+            "main": [],
+            "grad": [],
+            "reg": [],
+            "main_raw": [],  # sigma-free error: main / conf, tracks accuracy
+            "conf": [],  # mean confidence sigma: the weight applied to main
+        }
+        for g, p in zip(gts, preds, strict=True):
             if "depth" in p:
                 sigma_p = p["depth_conf"]
                 valid_mask = g["valid_mask"]
                 if not valid_mask.any():
                     valid_mask = torch.ones_like(g["valid_mask"])
-                depth_terms.append(
-                    self.depth_loss(
-                        p["depth"],
-                        g["depthmap"].unsqueeze(-1),
-                        sigma_p=sigma_p,
-                        valid_mask=valid_mask,
-                    )
+                term, comps = self.depth_loss(
+                    p["depth"],
+                    g["depthmap"].unsqueeze(-1),
+                    sigma_p=sigma_p,
+                    valid_mask=valid_mask,
+                    return_components=True,
                 )
+                depth_terms.append(term)
+                for k, v in comps.items():
+                    comp_terms[k].append(v)
         Ldepth = (
             torch.stack(depth_terms).mean()
             if depth_terms
@@ -106,5 +129,13 @@ class DepthTrainLoss(MultiLoss):
         for loss, weight in zip(losses, self.weights, strict=True):
             total += weight * loss[0]
             details[loss[1]] = loss[0]
+
+        # logging-only breakdown of Ldepth (NOT added to total; detached in
+        # DepthOrPmapLoss). Zeros when no frame carried a depth prediction,
+        # mirroring Ldepth's own fallback.
+        for name, terms in comp_terms.items():
+            details[f"Ldepth_{name}"] = (
+                torch.stack(terms).mean() if terms else torch.zeros_like(Ltemporal)
+            )
 
         return total, details
