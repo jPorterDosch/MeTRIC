@@ -15,6 +15,14 @@ def abs_rel(gt: np.ndarray, pred: np.ndarray) -> float:
     return abs_rel
 
 
+def rel_sq(gt: np.ndarray, pred: np.ndarray) -> float:
+    """Mean squared relative error -- the squared companion to abs_rel. Not
+    rooted, so it weights occasional large frame-to-frame jumps far more heavily
+    (a spike enters quadratically), surfacing temporal pops that the
+    mean-absolute abs_rel averages away."""
+    return float(((np.abs(gt - pred) / gt) ** 2).mean())
+
+
 @lru_cache(maxsize=8)
 def _pixel_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
     # Integer pixel coordinates: this matches the unprojection convention the
@@ -102,18 +110,24 @@ def tae(
     depth_pred_b: np.ndarray,
     mask_b: np.ndarray,
     img2lidar_b: np.ndarray,
-) -> float:
+) -> tuple[float, float]:
+    """Temporal alignment error between adjacent predictions. Returns BOTH
+    aggregations of the symmetric a<->b relative reprojection error, from the
+    same reprojection: (mean-absolute, mean-squared). The squared term is the
+    spike-sensitive companion -- a few large frame-to-frame jumps dominate it."""
     depth_a2b = point2depth(
         depth2point(depth_pred_a, mask_a, img2lidar_a), mask_b, img2lidar_b
     )
     mask = (depth_a2b > 1e-6) & mask_b
-    error_a2b = abs_rel(depth_pred_b[mask], depth_a2b[mask])
+    abs_a2b = abs_rel(depth_pred_b[mask], depth_a2b[mask])
+    sq_a2b = rel_sq(depth_pred_b[mask], depth_a2b[mask])
     depth_b2a = point2depth(
         depth2point(depth_pred_b, mask_b, img2lidar_b), mask_a, img2lidar_a
     )
     mask = (depth_b2a > 1e-6) & mask_a
-    error_b2a = abs_rel(depth_pred_a[mask], depth_b2a[mask])
-    return 0.5 * (error_a2b + error_b2a)
+    abs_b2a = abs_rel(depth_pred_a[mask], depth_b2a[mask])
+    sq_b2a = rel_sq(depth_pred_a[mask], depth_b2a[mask])
+    return 0.5 * (abs_a2b + abs_b2a), 0.5 * (sq_a2b + sq_b2a)
 
 
 def depth2disparity(depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
