@@ -1,9 +1,11 @@
+import io
 import os
 import json
 import os.path as osp
 import decimal
 import argparse
 import math
+import sys
 from bisect import bisect_left
 from PIL import Image
 import numpy as np
@@ -11,6 +13,14 @@ import quaternion
 from scipy import interpolate
 import cv2
 from tqdm import tqdm
+
+sys.path.insert(0, osp.join(osp.dirname(osp.abspath(__file__)), "..", "src"))
+from streamvggt.datasets.utils.zipio import (  # noqa: E402
+    SceneZipWriter,
+    asset_root,
+    listdir as zlistdir,
+    read_bytes,
+)
 
 
 def get_parser():
@@ -124,10 +134,20 @@ def main(rootdir, pairsdir, outdir):
             os.makedirs(out_scene_subdir, exist_ok=True)
 
             scene_dir = osp.join(rootdir, root_subdir, scene_subdir)
-            depth_dir = osp.join(scene_dir, "lowres_depth")
-            rgb_dir = osp.join(scene_dir, "vga_wide")
-            intrinsics_dir = osp.join(scene_dir, "vga_wide_intrinsics")
+            # asset_root resolves each raw asset for both layouts: an
+            # extracted <asset>/ directory, or the downloaded <asset>.zip
+            # left unextracted (inode-safe layout)
+            depth_dir = asset_root(scene_dir, "lowres_depth")
+            rgb_dir = asset_root(scene_dir, "vga_wide")
+            intrinsics_dir = asset_root(scene_dir, "vga_wide_intrinsics")
             traj_path = osp.join(scene_dir, "lowres_wide.traj")
+            if (
+                depth_dir is None
+                or rgb_dir is None
+                or intrinsics_dir is None
+                or not osp.isfile(traj_path)
+            ):
+                continue
 
             # STEP 2: read selected_pairs.npz
             selected_pairs_path = osp.join(
@@ -179,66 +199,65 @@ def main(rootdir, pairsdir, outdir):
                 )
                 assert selected_sky_direction_scene == sky_direction_scene
 
-                os.makedirs(os.path.join(out_scene_subdir, "vga_wide"), exist_ok=True)
-                os.makedirs(
-                    os.path.join(out_scene_subdir, "lowres_depth"), exist_ok=True
-                )
                 assert isinstance(sky_direction_scene, str)
-                all_exist = True
-                for basename in images:
-                    vga_wide_path = osp.join(rgb_dir, basename)
-                    depth_path = osp.join(depth_dir, basename)
-                    if not osp.isfile(vga_wide_path) or not osp.isfile(depth_path):
-                        all_exist = False
-                        break
-                if not all_exist:
+                img_names = set(zlistdir(rgb_dir))
+                depth_names = set(zlistdir(depth_dir))
+                if not all(
+                    basename in img_names and basename in depth_names
+                    for basename in images
+                ):
                     continue
 
-                for basename in images:
-                    img_out = os.path.join(
-                        out_scene_subdir, "vga_wide", basename.replace(".png", ".jpg")
-                    )
-                    depth_out = os.path.join(out_scene_subdir, "lowres_depth", basename)
-                    if osp.isfile(img_out) and osp.isfile(depth_out):
-                        continue
+                # all converted frames go into ONE uncompressed zip per scene
+                # (inode-safe layout); the write is atomic (.tmp -> rename)
+                # and the npz below is saved only after the zip completes, so
+                # the skip-on-npz check above implies a complete frames.zip
+                with SceneZipWriter(osp.join(out_scene_subdir, "frames.zip")) as writer:
+                    for basename in images:
+                        img = Image.open(
+                            io.BytesIO(read_bytes(osp.join(rgb_dir, basename)))
+                        )
+                        depth = cv2.imdecode(
+                            np.frombuffer(
+                                read_bytes(osp.join(depth_dir, basename)), np.uint8
+                            ),
+                            cv2.IMREAD_UNCHANGED,
+                        )
 
-                    vga_wide_path = osp.join(rgb_dir, basename)
-                    depth_path = osp.join(depth_dir, basename)
+                        # rotate the image
+                        if sky_direction_scene == "RIGHT":
+                            try:
+                                img = img.transpose(Image.Transpose.ROTATE_90)
+                            except Exception:
+                                img = img.transpose(Image.ROTATE_90)
+                            depth = cv2.rotate(depth, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                        elif sky_direction_scene == "LEFT":
+                            try:
+                                img = img.transpose(Image.Transpose.ROTATE_270)
+                            except Exception:
+                                img = img.transpose(Image.ROTATE_270)
+                            depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
+                        elif sky_direction_scene == "DOWN":
+                            try:
+                                img = img.transpose(Image.Transpose.ROTATE_180)
+                            except Exception:
+                                img = img.transpose(Image.ROTATE_180)
+                            depth = cv2.rotate(depth, cv2.ROTATE_180)
 
-                    img = Image.open(vga_wide_path)
-                    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                        W, H = img.size
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG")
+                        writer.writestr(
+                            "vga_wide/" + basename.replace(".png", ".jpg"),
+                            buf.getvalue(),
+                        )
 
-                    # rotate the image
-                    if sky_direction_scene == "RIGHT":
-                        try:
-                            img = img.transpose(Image.Transpose.ROTATE_90)
-                        except Exception:
-                            img = img.transpose(Image.ROTATE_90)
-                        depth = cv2.rotate(depth, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                    elif sky_direction_scene == "LEFT":
-                        try:
-                            img = img.transpose(Image.Transpose.ROTATE_270)
-                        except Exception:
-                            img = img.transpose(Image.ROTATE_270)
-                        depth = cv2.rotate(depth, cv2.ROTATE_90_CLOCKWISE)
-                    elif sky_direction_scene == "DOWN":
-                        try:
-                            img = img.transpose(Image.Transpose.ROTATE_180)
-                        except Exception:
-                            img = img.transpose(Image.ROTATE_180)
-                        depth = cv2.rotate(depth, cv2.ROTATE_180)
-
-                    W, H = img.size
-                    if not osp.isfile(img_out):
-                        img.save(img_out)
-
-                    depth = cv2.resize(
-                        depth, (W, H), interpolation=cv2.INTER_NEAREST_EXACT
-                    )
-                    if not osp.isfile(
-                        depth_out
-                    ):  # avoid destroying the base dataset when you mess up the paths
-                        cv2.imwrite(depth_out, depth)
+                        depth = cv2.resize(
+                            depth, (W, H), interpolation=cv2.INTER_NEAREST_EXACT
+                        )
+                        ok, enc = cv2.imencode(".png", depth)
+                        assert ok, f"png encode failed for {basename}"
+                        writer.writestr("lowres_depth/" + basename, enc.tobytes())
 
                 # save at the end
                 np.savez(
@@ -250,14 +269,20 @@ def main(rootdir, pairsdir, outdir):
                 )
 
         outlistfile = osp.join(outsubdir, "scene_list.json")
-        for scene_subdir in valid_scenes:
-            scene_metadata_path = osp.join(
-                outsubdir, scene_subdir, "scene_metadata.npz"
-            )
-            if not osp.isfile(scene_metadata_path):
-                valid_scenes.remove(scene_subdir)
+        # (filter with a comprehension: the upstream remove-while-iterating
+        # skipped the element after each removal, letting npz-less scenes
+        # survive into the STEP-5 concat and crash it)
+        valid_scenes = [
+            scene_subdir
+            for scene_subdir in valid_scenes
+            if osp.isfile(osp.join(outsubdir, scene_subdir, "scene_metadata.npz"))
+        ]
         with open(outlistfile, "w") as f:
             json.dump(valid_scenes, f)
+
+        if not valid_scenes:
+            print(f"No valid scenes for {subdir}; skipping all_metadata.npz")
+            continue
 
         # STEP 5: concat all scene_metadata.npz into a single file
         scene_data = {}
@@ -350,18 +375,20 @@ def convert_scene_metadata(
     trajectories = []
     intrinsics = []
     images = []
+    # membership in the listing replaces per-probe existence checks: same
+    # semantics in both layouts, and O(1) per probe instead of a stat / a
+    # namelist scan
+    intrinsic_names = set(zlistdir(intrinsics_dir))
     for i, (basename, frame_id) in enumerate(selected_images):
-        intrinsic_fn = osp.join(intrinsics_dir, f"{scene_subdir}_{frame_id}.pincam")
-        if not osp.exists(intrinsic_fn):
-            intrinsic_fn = osp.join(
-                intrinsics_dir, f"{scene_subdir}_{float(frame_id) - 0.001:.3f}.pincam"
-            )
-        if not osp.exists(intrinsic_fn):
-            intrinsic_fn = osp.join(
-                intrinsics_dir, f"{scene_subdir}_{float(frame_id) + 0.001:.3f}.pincam"
-            )
-        assert osp.exists(intrinsic_fn)
-        w, h, fx, fy, hw, hh = np.loadtxt(intrinsic_fn)  # PINHOLE
+        intrinsic_name = f"{scene_subdir}_{frame_id}.pincam"
+        if intrinsic_name not in intrinsic_names:
+            intrinsic_name = f"{scene_subdir}_{float(frame_id) - 0.001:.3f}.pincam"
+        if intrinsic_name not in intrinsic_names:
+            intrinsic_name = f"{scene_subdir}_{float(frame_id) + 0.001:.3f}.pincam"
+        assert intrinsic_name in intrinsic_names
+        w, h, fx, fy, hw, hh = np.loadtxt(
+            io.BytesIO(read_bytes(osp.join(intrinsics_dir, intrinsic_name)))
+        )  # PINHOLE
 
         pose = np.eye(4)
         pose[:3, :3] = quaternion.as_rotation_matrix(interpolated_rotations[i])

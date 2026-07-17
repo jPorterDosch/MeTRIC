@@ -12,6 +12,7 @@ from .base.base_multiview_dataset import (
 )
 from .types import Split
 from .utils.image import imread_cv2
+from .utils.zipio import frames_root
 
 # preserves the original DUSt3R ARKitScenes default; override via the
 # constructor or the DatasetConfig CLI rather than editing this constant.
@@ -225,7 +226,12 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         views = []
         for v, view_idx in enumerate(image_idxs):
             scene_id = self.sceneids[view_idx]
-            scene_dir = osp.join(self.ROOT, self.split_dir, self.scenes[scene_id])
+            # frames live either in the scene dir (extracted layout) or in
+            # its frames.zip (inode-safe layout); metadata npz reads above
+            # are unaffected (always real files in the scene dir)
+            scene_dir = frames_root(
+                osp.join(self.ROOT, self.split_dir, self.scenes[scene_id])
+            )
 
             intrinsics = self.intrinsics[view_idx]
             camera_pose = self.trajectories[view_idx]
