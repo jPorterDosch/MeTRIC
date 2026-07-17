@@ -66,7 +66,7 @@ def driver() -> None:
     cfg = FinetuneDepthCfg(
         pretrained="",  # skip the 5GB pretrained load; this is a plumbing test
         save_dir=os.environ["SC_SAVE_DIR"],
-        exp_name="stage8",
+        exp_group="stage8",
         epochs=int(os.environ["SC_EPOCHS"]),
         save_freq=0.5,  # int(0.5 * 12 steps) = 6 -> one mid-epoch save at step 6
         print_freq=5,

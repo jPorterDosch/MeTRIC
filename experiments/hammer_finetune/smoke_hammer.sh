@@ -48,7 +48,7 @@ mkdir -p "$REPO/logs/hammer_finetune_smoke"
 cd "$REPO/src"
 
 python finetune_depth.py \
-    --exp-name hammer_smoke \
+    --exp-group hammer_smoke \
     --pretrained "$REPO/ckpt/checkpoints.pth" \
     --save-dir /oscar/scratch/jdosch/checkpoints_smoke \
     \

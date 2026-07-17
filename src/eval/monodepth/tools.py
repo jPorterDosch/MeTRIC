@@ -1,11 +1,5 @@
 import torch
 import numpy as np
-import cv2
-import glob
-import argparse
-from pathlib import Path
-from tqdm import tqdm
-from copy import deepcopy
 from scipy.optimize import minimize
 import os
 from collections import defaultdict
@@ -384,10 +378,10 @@ def depth_evaluation(
         "Sq Rel": sq_rel,
         "RMSE": rmse,
         "Log RMSE": log_rmse,
-        "δ < 1.": threshold_0,
-        "δ < 1.25": threshold_1,
-        "δ < 1.25^2": threshold_2,
-        "δ < 1.25^3": threshold_3,
+        "delta < 1.": threshold_0,
+        "delta < 1.25": threshold_1,
+        "delta < 1.25^2": threshold_2,
+        "delta < 1.25^3": threshold_3,
         "valid_pixels": num_valid_pixels,
     }
 

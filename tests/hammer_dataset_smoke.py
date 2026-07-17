@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from dust3r.datasets import *  # noqa: E402,F403 (mirrors get_data_loader's eval namespace)
+from streamvggt.datasets import *  # noqa: E402,F403 (the real training loaders)
 
 DATA_ROOT = (
     sys.argv[1]
@@ -35,7 +35,10 @@ DATA_ROOT = (
 )
 NUM_VIEWS = 10
 RESOLUTION = (518, 392)
-EXPECTED_SEQS = {"train": 46, "test": 18}
+# default excludes the *_naked empty-table twins (half of each split); pass
+# include_naked=True to load the full 46/18 (checked separately in main).
+EXPECTED_SEQS = {"train": 23, "test": 9}
+EXPECTED_SEQS_WITH_NAKED = {"train": 46, "test": 18}
 VIEW_KEYS = {
     "img",
     "depthmap",
@@ -144,6 +147,22 @@ def cross_view_consistency(views, tag, max_med_err_mm=20.0):
 
 
 def main():
+    # the include_naked knob: default drops the naked twins, True restores them
+    for split in EXPECTED_SEQS:
+        n_default = len(build(split).scenes)
+        n_with = len(
+            eval(
+                f"HAMMER_Multi(split='{split}', ROOT='{DATA_ROOT}', "
+                f"resolution=[{RESOLUTION}], num_views={NUM_VIEWS}, n_corres=0, "
+                f"aug_crop=16, seed=777, include_naked=True)"
+            ).scenes
+        )
+        assert n_default == EXPECTED_SEQS[split], f"{split}: {n_default} (default)"
+        assert n_with == EXPECTED_SEQS_WITH_NAKED[split], f"{split}: {n_with} (naked)"
+        print(
+            f"[{split}] include_naked: {n_default} default / {n_with} with naked -- OK"
+        )
+
     for split, n_expected in EXPECTED_SEQS.items():
         ds = build(split)
         assert len(ds.scenes) == n_expected, (

@@ -52,7 +52,7 @@ mkdir -p "$REPO/logs"
 cd "$REPO/src"
 
 python finetune_depth.py \
-    --exp-name hammer_depth_cond_head \
+    --exp-group hammer_depth_cond_head \
     \
     `# --- model / checkpointing -------------------------------------------` \
     `# pretrained StreamVGGT weights; the whole backbone stays frozen`        \
@@ -88,7 +88,6 @@ python finetune_depth.py \
     --train-dataset.max-interval 20 \
     --train-dataset.epoch-size 4500 \
     --train-dataset.highres-root None \
-    --resume "$REPO/checkpoints/hammer_depth_cond_head_aed661b59c8b9220/checkpoint-2.pth" \
     \
     `# --- val data: HAMMER test split -------------------------------------` \
     `# val defaults: split test, num_views 4, single (518, 392) resolution,`  \
@@ -116,7 +115,7 @@ python finetune_depth.py \
     --warmup-epochs 0.5 \
     --weight-decay 0.05 \
     --amp 1 \
-    --seed 0 \
+    --seed 42 \
     \
     `# --- cadence -----------------------------------------------------------` \
     `# validate (loss + AbsRel/delta1/TAE) every epoch and keep the best`     \

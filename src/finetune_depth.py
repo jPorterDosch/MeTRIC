@@ -52,6 +52,8 @@ from streamvggt.depth_cond import (
 )
 from eval.temporal_consistency.metrics import depth_evaluation, tae
 from finetune import save_current_code, setup_for_distributed  # reuse
+from streamvggt.utils.geometry import unproject_depth_map_to_point_map
+from visual_util import predictions_to_glb
 from streamvggt.datasets import (
     CatDataset,
     DatasetName,
@@ -99,7 +101,12 @@ class FinetuneDepthCfg:
     pretrained: str = "../ckpt/checkpoints.pth"
     resume: str | None = None
     save_dir: str = "../checkpoints"
-    exp_name: str = "metric_depth_cond"
+    exp_group: str = "metric_depth_cond"
+    """Experiment / sweep label. Every run sharing it is bucketed under one group
+    in the wandb UI and nests its runs under ``<save_dir>/<exp_group>/<run_id>``; the
+    run_id (config hash) distinguishes the individual arms within the sweep, so a
+    whole ablation ladder gets one --exp-group. Naming only -- NOT part of the
+    config hash."""
 
     # optimization
     seed: int = 42
@@ -188,6 +195,13 @@ class FinetuneDepthCfg:
     print_freq: int = 10
     save_freq: float = 0.1
 
+    # visualization: export predicted-depth point clouds (.glb) during the
+    # val / streaming-eval passes to <output_dir>/glb/. Off by default; the
+    # cap bounds how many clips are written per pass (accumulated over the
+    # first batches). Not part of the experiment identity.
+    export_glb: bool = False
+    export_glb_max_clips: int = 4
+
     # derived at startup (do not set on the CLI)
     output_dir: str = ""
 
@@ -197,7 +211,7 @@ class FinetuneDepthCfg:
 # config -- nested depth_cond/lora/cache/train blocks included -- is hashed.
 _NON_IDENTITY_FIELDS = (
     "save_dir",
-    "exp_name",
+    "exp_group",
     "output_dir",
     "resume",
     "start_epoch",
@@ -206,11 +220,20 @@ _NON_IDENTITY_FIELDS = (
     "save_freq",
     "num_workers",
     "benchmark",
+    "export_glb",
+    "export_glb_max_clips",
 )
 
 
 def build_manifest(cfg: FinetuneDepthCfg) -> dict:
     return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
+
+
+def _dataset_tag(config: MultiDatasetConfig) -> str:
+    """Short wandb section tag for a dataset mixture: "hammer",
+    "hammer+scannet", ... Robust to the enum members not being coerced yet
+    (plain strings before validate())."""
+    return "+".join(getattr(d, "value", str(d)) for d in config.dataset)
 
 
 def build_train_loader(
@@ -322,7 +345,10 @@ def run(
 
     wandb_config = {**to_primitive(args), **manifest, **record}
     wandb_init_kwargs = {
-        "name": f"{args.exp_name}_{run_id}",
+        "name": f"{args.exp_group}_{run_id}",
+        # group -> every run sharing exp_group is bucketed together in the wandb
+        # UI (e.g. all arms of one ablation ladder); run_id keeps names unique
+        "group": args.exp_group,
         "dir": args.output_dir,
     }
     if WANDB_ENTITY:
@@ -451,13 +477,20 @@ def run(
                 step=(epoch + 1) * len(data_loader_train),
                 args=args,
                 mcfg=mcfg,
+                prefix=f"val/{_dataset_tag(args.val_dataset)}",
             )
-            # select on the AVG, not the median: SmoothedValue syncs only
-            # count/total across ranks, so global_avg is global while median
-            # stays rank-local -- under DDP a median-based decision would use
-            # rank 0's shard only and best_so_far would diverge across ranks
-            if val_stats["loss_avg"] < best_so_far:
-                best_so_far = val_stats["loss_avg"]
+            # Select "best" on metric AbsRel, NOT the criterion loss. The
+            # confidence-regularized loss (-alpha*log sigma) is not monotonic
+            # with depth quality: it can keep falling as the confidence inflates
+            # while AbsRel plateaus/worsens, so selecting on loss_avg pinned
+            # "best" to the earliest epoch. absrel_metric_avg (metric-scale,
+            # lower is better) tracks the actual objective and is already
+            # globally reduced across ranks (_reduce_depth_metrics), so it needs
+            # no median/avg caveat. Fall back to loss_avg only if the metric
+            # never fired on any rank (e.g. a val pass with no valid GT pixels).
+            selection = val_stats.get("absrel_metric_avg", val_stats["loss_avg"])
+            if selection < best_so_far:
+                best_so_far = selection
                 save_model(epoch, "best", best_so_far, args.start_step)
 
     total_time = time.time() - start_time
@@ -475,6 +508,7 @@ def run(
             step=args.epochs * len(data_loader_train),
             args=args,
             mcfg=mcfg,
+            prefix=f"final_stream/{_dataset_tag(args.val_dataset)}",
         )
 
     output_dir = Path(args.output_dir)
@@ -603,9 +637,11 @@ def train_loop(
                 loss_value_reduce = accelerator.gather(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()
+                # "/"-namespaced keys so wandb groups metrics into sections
+                # (train/..., val/<dataset>/..., stream/<dataset>/...)
                 log_dict = {
-                    "train_loss": loss_value_reduce,
-                    "train_lr": lr,
+                    "train/loss": loss_value_reduce,
+                    "train/lr": lr,
                     "epoch": epoch_f,
                 }
                 for name, val in loss_details.items():
@@ -613,7 +649,7 @@ def train_loop(
                         continue
                     if isinstance(val, dict):
                         continue
-                    log_dict["train_" + name] = val
+                    log_dict["train/" + name] = val
                 accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
         # mid-epoch checkpoint-last saves (ported from finetune.py): without
@@ -655,6 +691,87 @@ def _stack_depth_batch(
     return pred, gt, valid, K, pose
 
 
+def _clip_predictions(
+    img: torch.Tensor,
+    depth: torch.Tensor,
+    valid: torch.Tensor,
+    K: torch.Tensor,
+    pose: torch.Tensor,
+) -> dict:
+    """Assemble the numpy `predictions` dict predictions_to_glb consumes, for a
+    single clip. Inputs are the per-clip slices of _stack_depth_batch plus the
+    images: img [S,3,H,W] in [0,1], depth [S,H,W], valid [S,H,W] bool,
+    K [S,3,3], pose [S,4,4] cam2world.
+
+    Both the unprojector and predictions_to_glb want world->cam extrinsics of
+    shape [S,3,4] -- depth_to_world_coords_points is documented "cam from
+    world", and the glb builder inverts extrinsic to place the camera frustums
+    -- so we invert the cam2world pose ONCE and hand the same array to both;
+    point cloud and cameras then live in one frame. Invalid pixels get zero
+    confidence, which predictions_to_glb's conf>1e-5 filter drops (paired with
+    conf_thres=0.0, so no valid pixels are thresholded out)."""
+    world2cam = np.linalg.inv(pose.numpy())[:, :3, :4].astype(np.float32)  # [S,3,4]
+    # the unprojector does a hard np.squeeze(-1) per frame, so it needs the
+    # trailing singleton (_stack_depth_batch already dropped it -> [S,H,W])
+    world_points = unproject_depth_map_to_point_map(
+        depth.numpy()[..., None], world2cam, K.numpy()
+    )  # [S,H,W,3]
+    # confidence = GT-valid AND finite prediction. Dropping non-finite pixels
+    # matters: a NaN/Inf predicted depth (bad/early ckpt) at a GT-valid pixel
+    # would survive predictions_to_glb's conf>1e-5 filter and poison the
+    # np.percentile scene-scale (-> NaN camera sizing for the whole clip).
+    conf = (valid & torch.isfinite(depth)).numpy().astype(np.float32)
+    return {
+        "world_points_from_depth": world_points,
+        "depth_conf": conf,
+        "images": img.numpy(),
+        "extrinsic": world2cam,
+    }
+
+
+def _export_eval_glbs(
+    views: list[dict],
+    preds: list[dict],
+    out_dir: str,
+    tag: str,
+    accelerator: Accelerator,
+    start_idx: int,
+    max_clips: int,
+) -> int:
+    """Write up to (max_clips - start_idx) predicted-depth point clouds from
+    THIS batch to <out_dir>/glb/<tag>_clipN.glb and return how many were
+    written, so the caller can accumulate across batches until it reaches
+    max_clips. N is a pass-global index so clips from successive batches do not
+    collide. Main process only: the export is redundant across ranks (the val /
+    stream loaders shard the same clip set), and predictions_to_glb prints /
+    does file IO we do not want N-fold."""
+    if not accelerator.is_main_process or start_idx >= max_clips:
+        return 0
+    glb_dir = os.path.join(out_dir, "glb")
+    os.makedirs(glb_dir, exist_ok=True)
+    # img is not in _stack_depth_batch; stack it the same way ([B,S,3,H,W])
+    imgs = torch.stack([v["img"] for v in views], dim=1).float().cpu()
+    pred, _, valid, K, pose = _stack_depth_batch(views, preds)
+    written = 0
+    for b in range(pred.shape[0]):
+        if start_idx + written >= max_clips:
+            break
+        predictions = _clip_predictions(imgs[b], pred[b], valid[b], K[b], pose[b])
+        # prediction_mode without "Pointmap" takes the world_points_from_depth
+        # branch directly (no missing-key fallback warning)
+        scene = predictions_to_glb(
+            predictions,
+            conf_thres=0.0,
+            show_cam=True,
+            prediction_mode="Depthmap and Camera",
+        )
+        scene.export(
+            file_obj=os.path.join(glb_dir, f"{tag}_clip{start_idx + written}.glb")
+        )
+        written += 1
+    return written
+
+
 def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     """Matrix mapping homogeneous pixel coords (u*z, v*z, z, 1) to world, the
     convention metrics.tae expects: inv(K_4x4 @ world2cam) = cam2world @
@@ -665,6 +782,17 @@ def _img2lidar(K: torch.Tensor, pose: torch.Tensor) -> np.ndarray:
     return pose.numpy() @ np.linalg.inv(k4)
 
 
+def _clip_dataset(views: list[dict], b: int) -> str:
+    """Dataset label of clip b (all views in a clip come from one scene, hence
+    one dataset). The collated 'dataset' field is a per-sample list/tuple; a
+    bare str covers the unbatched case. Lowercased so keys are consistent
+    regardless of loader casing (HAMMER_Multi emits 'hammer', ScanNet_Multi
+    'ScanNet')."""
+    d = views[0].get("dataset", "unknown")
+    label = d if isinstance(d, str) else d[b]
+    return str(label).lower()
+
+
 def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[float]]:
     """Sequence-level depth metrics for one batch: affine-invariant (one lstsq
     scale/shift over the whole clip) and metric (no-alignment) AbsRel /
@@ -672,7 +800,9 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
     whole-clip alignment is non-causal -- fine for the training-forward val
     pass; the streaming eval uses _streaming_depth_metrics instead.
     Returns PER-CLIP value lists (not batch means) so the caller's
-    accumulation weights every clip equally regardless of batch size."""
+    accumulation weights every clip equally regardless of batch size. Keys are
+    '<dataset>/<metric>' so a mixed-dataset val set yields per-dataset numbers
+    (the caller blends them for the overall figure)."""
     pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
 
     out: dict[str, list[float]] = {}
@@ -681,6 +811,7 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         mask = valid[b] & (gt[b] > 0)  # [S,H,W]
         if not mask.any():
             continue
+        ds = _clip_dataset(views, b)
         # the 3rd return is the aligned full-size prediction, reused for TAE
         res_affine, _, aligned, _ = depth_evaluation(
             pred[b], gt[b], custom_mask=mask, scale_and_shift=True
@@ -689,15 +820,19 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
         res_metric, _, _, _ = depth_evaluation(
             pred[b], gt[b], custom_mask=mask, metric_scale=True
         )
-        out.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
-        out.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
-        out.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
-        out.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+        out.setdefault(f"{ds}/absrel_affine", []).append(res_affine["Abs Rel"])
+        out.setdefault(f"{ds}/delta1_affine", []).append(res_affine["delta < 1.25"])
+        out.setdefault(f"{ds}/rmse_affine", []).append(res_affine["RMSE"])
+        out.setdefault(f"{ds}/absrel_metric", []).append(res_metric["Abs Rel"])
+        out.setdefault(f"{ds}/delta1_metric", []).append(res_metric["delta < 1.25"])
+        # RMSE in metres: absolute error magnitude the relative AbsRel hides --
+        # the calibration number for a metric-conditioned model.
+        out.setdefault(f"{ds}/rmse_metric", []).append(res_metric["RMSE"])
 
         aligned = aligned.reshape(S, H, W).numpy()
         mask_np = mask.numpy()
         i2l = [_img2lidar(K[b, i], pose[b, i]) for i in range(S)]
-        errs = [
+        pairs = [
             tae(
                 aligned[i],
                 mask_np[i],
@@ -708,9 +843,15 @@ def _val_depth_metrics(views: list[dict], preds: list[dict]) -> dict[str, list[f
             )
             for i in range(S - 1)
         ]
-        errs = [e for e in errs if np.isfinite(e)]
-        if errs:
-            out.setdefault("tae", []).append(float(np.mean(errs)))
+        # tae -> (mean-abs, mean-sq) of the relative frame-to-frame error; tae_sq
+        # is the spike-sensitive squared companion (finiteness of the two
+        # coincides, but filter each independently to be safe).
+        abs_errs = [a for a, _ in pairs if np.isfinite(a)]
+        sq_errs = [s for _, s in pairs if np.isfinite(s)]
+        if abs_errs:
+            out.setdefault(f"{ds}/tae", []).append(float(np.mean(abs_errs)))
+        if sq_errs:
+            out.setdefault(f"{ds}/tae_sq", []).append(float(np.mean(sq_errs)))
     return out
 
 
@@ -727,8 +868,10 @@ def _streaming_depth_metrics(
     out: dict[str, list[float]] = {}
     B, S, H, W = gt.shape
     for b in range(B):
+        ds = _clip_dataset(views, b)
         frame_stats: dict[str, list[float]] = {}
         errs: list[float] = []
+        sq_errs: list[float] = []
         prev: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         for i in range(S):
             mask = valid[b, i] & (gt[b, i] > 0)  # [H,W]
@@ -741,9 +884,16 @@ def _streaming_depth_metrics(
                 pred[b, i], gt[b, i], custom_mask=mask, metric_scale=True
             )
             frame_stats.setdefault("absrel_affine", []).append(res_affine["Abs Rel"])
-            frame_stats.setdefault("delta1_affine", []).append(res_affine["δ < 1.25"])
+            frame_stats.setdefault("delta1_affine", []).append(
+                res_affine["delta < 1.25"]
+            )
+            frame_stats.setdefault("rmse_affine", []).append(res_affine["RMSE"])
             frame_stats.setdefault("absrel_metric", []).append(res_metric["Abs Rel"])
-            frame_stats.setdefault("delta1_metric", []).append(res_metric["δ < 1.25"])
+            frame_stats.setdefault("delta1_metric", []).append(
+                res_metric["delta < 1.25"]
+            )
+            # RMSE in metres: absolute error the relative AbsRel hides
+            frame_stats.setdefault("rmse_metric", []).append(res_metric["RMSE"])
 
             cur = (
                 pred[b, i].numpy(),
@@ -751,51 +901,82 @@ def _streaming_depth_metrics(
                 _img2lidar(K[b, i], pose[b, i]),
             )
             if prev is not None:
-                err = tae(*prev, *cur)
+                err, err_sq = tae(*prev, *cur)
                 if np.isfinite(err):
                     errs.append(err)
+                if np.isfinite(err_sq):
+                    sq_errs.append(err_sq)
             prev = cur
         for k, v in frame_stats.items():
-            out.setdefault(k, []).append(float(np.mean(v)))
+            out.setdefault(f"{ds}/{k}", []).append(float(np.mean(v)))
         if errs:
-            out.setdefault("tae", []).append(float(np.mean(errs)))
+            out.setdefault(f"{ds}/tae", []).append(float(np.mean(errs)))
+        if sq_errs:
+            out.setdefault(f"{ds}/tae_sq", []).append(float(np.mean(sq_errs)))
     return out
 
 
-# the full depth-metric key set, in one canonical order. The per-batch dicts
-# are data-dependent (a rank can see a clip with no valid pixels or no finite
-# TAE pair), so cross-rank reductions must run over this fixed list -- never
-# over whatever keys happened to fire on one rank.
+# the depth metrics, in one canonical order. The per-dataset accumulator keys
+# are "<dataset>/<metric>"; the blended (dataset-agnostic) logged keys are just
+# "<metric>".
 _DEPTH_METRIC_KEYS = (
     "absrel_affine",
     "delta1_affine",
+    "rmse_affine",
     "absrel_metric",
     "delta1_metric",
+    "rmse_metric",
     "tae",
+    "tae_sq",
 )
 
 
 def _reduce_depth_metrics(
     sums: dict[str, float], counts: dict[str, int], accelerator: Accelerator
 ) -> dict[str, float]:
-    """Cross-rank mean of the depth-metric accumulators in ONE fixed-order
-    collective. Feeding the per-batch (data-dependent) keys through the
-    per-meter MetricLogger sync instead can pair mismatched meters across
-    ranks: an NCCL hang when key sets differ, silently mixed stats when only
-    the order does. Keys that never fired on any rank are omitted."""
+    """Cross-rank mean of the per-dataset depth-metric accumulators, plus a
+    dataset-blended value per metric. Input keys are "<dataset>/<metric>".
+
+    The reduced key set is UNIONED across ranks first: the accumulators are
+    data-dependent (a rank's shard may miss a whole dataset, or a metric that
+    never fired -- e.g. no finite TAE pair), so a per-rank key list would give
+    mismatched collective shapes and hang NCCL. Unioning yields one fixed order
+    every rank agrees on. Keys with zero global count are dropped.
+
+    Returns log-ready keys: "<dataset>_<metric>" (per dataset) and "<metric>"
+    (blended over datasets, count-weighted -- what checkpoint selection reads)."""
+    keys = sorted(set(sums) | set(counts))
+    if accelerator.num_processes > 1:
+        from accelerate.utils import gather_object
+
+        # [keys] per rank -> list of each rank's key list -> flatten to the union
+        keys = sorted({k for part in gather_object([keys]) for k in part})
+    if not keys:
+        return {}
+
     t = torch.tensor(
-        [[sums[k], counts[k]] for k in _DEPTH_METRIC_KEYS],
+        [[sums.get(k, 0.0), counts.get(k, 0)] for k in keys],
         dtype=torch.float64,
         device=accelerator.device,
     )
     if accelerator.num_processes > 1:
         accelerator.wait_for_everyone()
         accelerator.reduce(t, reduction="sum")
-    return {
-        k: (t[i, 0] / t[i, 1]).item()
-        for i, k in enumerate(_DEPTH_METRIC_KEYS)
-        if t[i, 1] > 0
-    }
+
+    out: dict[str, float] = {}
+    blended_sum: dict[str, float] = defaultdict(float)
+    blended_cnt: dict[str, float] = defaultdict(float)
+    for i, key in enumerate(keys):
+        s, c = t[i, 0].item(), t[i, 1].item()
+        dataset, metric = key.split("/", 1)
+        blended_sum[metric] += s
+        blended_cnt[metric] += c
+        if c > 0:
+            out[f"{dataset}_{metric}"] = s / c
+    for metric, c in blended_cnt.items():
+        if c > 0:
+            out[metric] = blended_sum[metric] / c
+    return out
 
 
 def _log_val_stats(
@@ -827,7 +1008,7 @@ def _log_val_stats(
             continue
         if isinstance(val, dict):
             continue
-        log_dict[prefix + "_" + name] = val
+        log_dict[prefix + "/" + name] = val
     accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
     return results
 
@@ -858,8 +1039,9 @@ def val_loop(
     # and ResizedDataset its slot mapping from epoch + 777, so this yields the
     # identical clip set and order on every validation
     _set_data_epoch(data_loader, 0)
-    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
-    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    depth_sums: dict[str, float] = defaultdict(float)
+    depth_counts: dict[str, int] = defaultdict(int)
+    glb_exported = 0
 
     # fork + fix the torch RNG: the sparse-conditioning masks (torch.rand) and
     # query-point sampling are identical every epoch, and the training RNG
@@ -887,6 +1069,20 @@ def val_loop(
             for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
+            # only the FINAL epoch's val pass writes GLBs -- a quick end-of-run
+            # sanity check, not one set per epoch (visualize_depth.py can render
+            # any checkpoint, incl. best, on demand). streaming_eval writes its
+            # own single set after training.
+            if args.export_glb and epoch == args.epochs - 1:
+                glb_exported += _export_eval_glbs(
+                    result["views"],
+                    result["pred"],
+                    args.output_dir,
+                    tag=prefix,
+                    accelerator=accelerator,
+                    start_idx=glb_exported,
+                    max_clips=args.export_glb_max_clips,
+                )
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
@@ -921,8 +1117,9 @@ def streaming_eval(
     metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
     header = "Streaming eval:"
     _set_data_epoch(data_loader, 0)  # same epoch-0 pin as val_loop
-    depth_sums = dict.fromkeys(_DEPTH_METRIC_KEYS, 0.0)
-    depth_counts = dict.fromkeys(_DEPTH_METRIC_KEYS, 0)
+    depth_sums: dict[str, float] = defaultdict(float)
+    depth_counts: dict[str, int] = defaultdict(int)
+    glb_exported = 0
 
     devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
@@ -952,6 +1149,16 @@ def streaming_eval(
             for k, vals in stats.items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
+            if args.export_glb:
+                glb_exported += _export_eval_glbs(
+                    result["views"],
+                    result["pred"],
+                    args.output_dir,
+                    tag=prefix,
+                    accelerator=accelerator,
+                    start_idx=glb_exported,
+                    max_clips=args.export_glb_max_clips,
+                )
             del result, batch
 
     depth_avgs = _reduce_depth_metrics(depth_sums, depth_counts, accelerator)
@@ -970,7 +1177,7 @@ def main(cfg: FinetuneDepthCfg) -> None:
     run_hash = experiment_hash(manifest)  # full, canonical identity (record + wandb)
     run_id = experiment_id(manifest)  # short display id, single source of truth
     cfg.output_dir = resolve_output_dir(cfg, run_id)
-    print(f"Experiment {cfg.exp_name} id {run_id} -> {cfg.output_dir}")
+    print(f"Experiment {cfg.exp_group} id {run_id} -> {cfg.output_dir}")
 
     run(cfg, mcfg, manifest, run_hash, run_id)
 
