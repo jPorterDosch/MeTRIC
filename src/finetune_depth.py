@@ -229,6 +229,13 @@ def build_manifest(cfg: FinetuneDepthCfg) -> dict:
     return experiment_manifest(cfg, exclude=_NON_IDENTITY_FIELDS)
 
 
+def _dataset_tag(config: MultiDatasetConfig) -> str:
+    """Short wandb section tag for a dataset mixture: "hammer",
+    "hammer+scannet", ... Robust to the enum members not being coerced yet
+    (plain strings before validate())."""
+    return "+".join(getattr(d, "value", str(d)) for d in config.dataset)
+
+
 def build_train_loader(
     args: FinetuneDepthCfg,
     split: Split,
@@ -470,6 +477,7 @@ def run(
                 step=(epoch + 1) * len(data_loader_train),
                 args=args,
                 mcfg=mcfg,
+                prefix=f"val/{_dataset_tag(args.val_dataset)}",
             )
             # Select "best" on metric AbsRel, NOT the criterion loss. The
             # confidence-regularized loss (-alpha*log sigma) is not monotonic
@@ -500,6 +508,7 @@ def run(
             step=args.epochs * len(data_loader_train),
             args=args,
             mcfg=mcfg,
+            prefix=f"final_stream/{_dataset_tag(args.val_dataset)}",
         )
 
     output_dir = Path(args.output_dir)
@@ -628,9 +637,11 @@ def train_loop(
                 loss_value_reduce = accelerator.gather(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()
+                # "/"-namespaced keys so wandb groups metrics into sections
+                # (train/..., val/<dataset>/..., stream/<dataset>/...)
                 log_dict = {
-                    "train_loss": loss_value_reduce,
-                    "train_lr": lr,
+                    "train/loss": loss_value_reduce,
+                    "train/lr": lr,
                     "epoch": epoch_f,
                 }
                 for name, val in loss_details.items():
@@ -638,7 +649,7 @@ def train_loop(
                         continue
                     if isinstance(val, dict):
                         continue
-                    log_dict["train_" + name] = val
+                    log_dict["train/" + name] = val
                 accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
 
         # mid-epoch checkpoint-last saves (ported from finetune.py): without
@@ -997,7 +1008,7 @@ def _log_val_stats(
             continue
         if isinstance(val, dict):
             continue
-        log_dict[prefix + "_" + name] = val
+        log_dict[prefix + "/" + name] = val
     accelerator.log(misc.aggregate_per_view_metrics(log_dict), step=step)
     return results
 
