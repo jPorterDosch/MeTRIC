@@ -451,12 +451,6 @@ def save_model(
         print(f">> Saving model to {checkpoint_path} ...")
         save_on_master(accelerator, to_save, checkpoint_path)
 
-        to_save = {
-            "model": model_without_ddp.state_dict(),
-        }
-        checkpoint_path = output_dir / ("model.pth")
-        save_on_master(accelerator, to_save, checkpoint_path)
-
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
     args.start_epoch = 0
