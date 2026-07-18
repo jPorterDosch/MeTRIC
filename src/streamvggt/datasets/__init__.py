@@ -17,6 +17,7 @@ from .base.easy_dataset import CatDataset
 from .config import DatasetConfig, MultiDatasetConfig, build_dataset
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
+from .hypersim import HyperSim_Multi
 from .scannet import ScanNet_Multi
 
 import torch
@@ -26,6 +27,7 @@ __all__ = [
     "ARKitScenes_Multi",
     "ARKitScenesHighRes_Multi",
     "HAMMER_Multi",
+    "HyperSim_Multi",
     "ScanNet_Multi",
     "BatchedRandomSampler",
     "CatDataset",

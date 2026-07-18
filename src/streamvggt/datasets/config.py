@@ -31,6 +31,7 @@ from .arkitscenes_highres import ARKitScenesHighRes_Multi
 from .base.base_multiview_dataset import BaseMultiViewDataset
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
+from .hypersim import HyperSim_Multi
 from .scannet import ScanNet_Multi
 from .utils.transforms import ColorJitter, ImgNorm, SeqColorJitter
 
@@ -171,6 +172,8 @@ class DatasetConfig:
                 dataset = ARKitScenesHighRes_Multi(**kwargs)
             case DatasetName.SCANNET:
                 dataset = ScanNet_Multi(**kwargs)
+            case DatasetName.HYPERSIM:
+                dataset = HyperSim_Multi(**kwargs)
             case _:
                 raise ValueError(f"Unknown dataset: {self.dataset!r}")
 
