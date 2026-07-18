@@ -162,13 +162,16 @@ class FinetuneDepthCfg:
     # num_views 4, seed 42 (per-__getitem__ reseed -> deterministic clips).
     # Note Split.VAL does not exist -- the dataset classes only accept
     # TRAIN/TEST (highres maps TEST to its Validation/ tree on disk).
+    # Default val: ScanNet scans_test (real-sensor depth, exists on the
+    # cluster today). ARKitScenes was dropped as the default when its raw
+    # dataset was found to be ~5.7TB; runs can still override per-experiment
+    # (the hammer sweep passes --val-dataset.* explicitly).
     val_dataset: MultiDatasetConfig = field(
         default_factory=lambda: MultiDatasetConfig(
-            root=(Path("../data/train/processed_arkitscenes/"),),
-            dataset=(DatasetName.ARKITSCENES_LOWRES,),
-            max_interval=(8,),
+            root=(Path("/gpfs/data/jtompki1/cli277/metric/processed_scannet"),),
+            dataset=(DatasetName.SCANNET,),
+            max_interval=(30,),
             epoch_size=(1000,),
-            highres_root=(Path("../data/train/processed_arkitscenes_highres/"),),
             num_views=4,
             resolution=((518, 392),),
             split=Split.TEST,
@@ -498,8 +501,7 @@ def run(
         "Training time {}".format(str(datetime.timedelta(seconds=int(total_time))))
     )
 
-    # final causal evaluation on the deployment (per-frame KV-cache) path;
-    # must run before the final save below moves the model to cpu
+    # final causal evaluation on the deployment (per-frame KV-cache) path.
     if data_loader_stream is not None:
         streaming_eval(
             model,
@@ -511,14 +513,10 @@ def run(
             prefix=f"final_stream/{_dataset_tag(args.val_dataset)}",
         )
 
-    output_dir = Path(args.output_dir)
-    to_save = {
-        "args": picklable_args(args),
-        "model": accelerator.unwrap_model(model).cpu().state_dict(),
-        "epoch": args.epochs,
-    }
-    printer.info(f">> Saving model to {output_dir / 'checkpoint-final.pth'} ...")
-    misc.save_on_master(accelerator, to_save, output_dir / "checkpoint-final.pth")
+    # No separate checkpoint-final.pth: the `epoch == args.epochs` branch above
+    # always writes checkpoint-last.pth after the final training epoch, and only
+    # the (weight-preserving) streaming_eval runs since, so checkpoint-last.pth
+    # already holds the end-of-training weights (plus optimizer state).
     accelerator.end_training()
 
 

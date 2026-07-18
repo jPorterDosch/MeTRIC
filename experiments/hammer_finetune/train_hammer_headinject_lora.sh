@@ -42,6 +42,10 @@ DATA=/oscar/scratch/jdosch/data/processed_hammer
 
 # --- environment: the StreamVGGT conda env has torch/accelerate/tyro etc. ---
 export PATH=/users/jdosch/miniconda3/envs/StreamVGGT/bin:$PATH
+# expandable_segments: avoids fragmentation-class OOMs (LoRA arms run at the
+# edge of L40S memory; the frozen-backbone arms never build a training graph
+# through the aggregator, so only these two scripts need it)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source .secrets/wandb-personal.env
 
@@ -87,7 +91,7 @@ python finetune_depth.py \
     --val-dataset.highres-root None \
     \
     `# --- optimization ------------------------------------------------------` \
-    --batch-size 2 \
+    --batch-size 1 \
     --accum-iter 1 \
     --epochs 5 \
     --lr 1e-5 \

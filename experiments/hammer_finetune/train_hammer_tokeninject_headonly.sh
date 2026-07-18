@@ -80,7 +80,7 @@ python finetune_depth.py \
     --val-dataset.highres-root None \
     \
     `# --- optimization ------------------------------------------------------` \
-    --batch-size 2 \
+    --batch-size 1 \
     --accum-iter 1 \
     --epochs 5 \
     --lr 1e-5 \

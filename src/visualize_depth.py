@@ -51,9 +51,11 @@ from streamvggt.depth_cond import (
 )
 
 # Checkpoint basenames finetune_depth.py writes, best -> worst preference when
-# --checkpoint is left at "auto".
+# --checkpoint is left at "auto". The pipeline no longer writes a separate
+# checkpoint-final.pth; the end-of-training weights live in checkpoint-last.pth,
+# so the "final" alias now resolves there (kept for backward compatibility).
 _CKPT_NAMES = {
-    "final": "checkpoint-final.pth",
+    "final": "checkpoint-last.pth",
     "best": "checkpoint-best.pth",
     "last": "checkpoint-last.pth",
 }
