@@ -67,6 +67,7 @@ DATA_CASES = [
     (DatasetName.ARKITSCENES_LOWRES, "processed_arkitscenes", 8),
     (DatasetName.ARKITSCENES_HIGHRES, "processed_arkitscenes_highres", 8),
     (DatasetName.SCANNET, "processed_scannet", 30),
+    (DatasetName.HYPERSIM, "processed_hypersim", 4),
 ]
 
 
@@ -94,6 +95,7 @@ def check_self_contained():
 def check_registration():
     for name in (
         "HAMMER_Multi",
+        "HyperSim_Multi",
         "ARKitScenes_Multi",
         "ARKitScenesHighRes_Multi",
         "ScanNet_Multi",
@@ -114,6 +116,7 @@ def check_registration():
         "arkitscenes_lowres",
         "arkitscenes_highres",
         "scannet",
+        "hypersim",
     }
     print("  [2] registration + exports; DatasetName covers the built datasets")
 

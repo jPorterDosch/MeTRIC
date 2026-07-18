@@ -25,6 +25,7 @@ class DatasetName(str, enum.Enum):
     ARKITSCENES_LOWRES = "arkitscenes_lowres"
     ARKITSCENES_HIGHRES = "arkitscenes_highres"
     SCANNET = "scannet"
+    HYPERSIM = "hypersim"
 
 
 class TransformName(str, enum.Enum):
