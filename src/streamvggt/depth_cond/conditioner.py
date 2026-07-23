@@ -197,6 +197,17 @@ class DepthConditioner(nn.Module):
                 # is a no-op and the model output equals the pretrained baseline.
                 # (Only ONE zero in the path -- a zero gate on top of a zero-init
                 # projection would kill both gradients.)
+                # TODO(soft deadlock): one zero is still one too many when it is a
+                # scalar on the WHOLE branch: grad(token_proj) is scaled by the
+                # gate, so at gate=0 token_proj gets no gradient and can only
+                # learn ~|gate| slower thereafter. The gate, meanwhile, only grows
+                # if the (still-random) token_proj output is useful -- so it hovers
+                # at ~0 (measured -0.003 after 5 epochs in the HAMMER sweep, arm
+                # b536d87d) and the token arm effectively cannot bootstrap. Fix by
+                # copying the LoRA pattern (zero-init the token_proj OUTPUT and
+                # drop the scalar gate: its grad does not depend on itself, cf.
+                # lora_B which trained fine in the same runs), or init the gate
+                # nonzero (~0.1), or give the gate its own high-LR param group.
                 self.gate = nn.Parameter(torch.zeros(()))
             case _:
                 raise ValueError(f"unknown injection type: {self.injection!r}")

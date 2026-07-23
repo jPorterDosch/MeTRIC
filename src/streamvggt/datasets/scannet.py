@@ -9,9 +9,9 @@ from .base.base_multiview_dataset import BaseMultiViewDataset, EmptyDatasetError
 from .types import Split
 from .utils.image import imread_cv2
 
-# preserves the original DUSt3R ScanNet default; override via the constructor or
-# the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 30
+# preserves the original DUSt3R ScanNet stride cap; override via the constructor
+# or the DatasetConfig CLI rather than editing this constant.
+DEFAULT_STRIDE_RANGE = (1, 30)
 
 
 class ScanNet_Multi(BaseMultiViewDataset):
@@ -24,19 +24,14 @@ class ScanNet_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
         is_metric=True,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        if not isinstance(max_interval, int) or max_interval < 1:
-            raise ValueError(
-                f"ScanNet max_interval must be a positive int, got {max_interval!r}"
-            )
-        self.max_interval = max_interval
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, stride_range=stride_range, **kwargs)
         match self.split:
             case Split.TRAIN:
                 subdir = "scans_train"
@@ -121,11 +116,7 @@ class ScanNet_Multi(BaseMultiViewDataset):
             num_views,
             start_id,
             all_image_ids,
-            rng,
-            max_interval=self.max_interval,
-            video_prob=0.6,
-            fix_interval_prob=0.6,
-            block_shuffle=16,
+            rng,  # stride/order policy: self.stride_range + base defaults
         )
         image_idxs = np.array(all_image_ids)[pos]
 

@@ -9,6 +9,7 @@ import numpy as np
 import PIL
 import torch
 
+from ..types import Split
 from ..utils import cropping
 from ..utils.corr import extract_correspondences_from_pts3d
 from ..utils.geometry import depthmap_to_absolute_camera_coordinates
@@ -23,13 +24,22 @@ class EmptyDatasetError(RuntimeError):
     not by message text."""
 
 
-def validate_max_interval(max_interval, dataset_name):
-    """Shared constructor guard: max_interval must be a positive int."""
-    if not isinstance(max_interval, int) or max_interval < 1:
+def validate_stride_range(stride_range, dataset_name):
+    """Shared constructor guard: stride_range must be a (lo, hi) pair of ints
+    with 1 <= lo <= hi. Returned as a plain tuple so equality checks against
+    (1, 1) are reliable regardless of the input container."""
+    try:
+        lo, hi = stride_range
+    except (TypeError, ValueError):
         raise ValueError(
-            f"{dataset_name} max_interval must be a positive int, got {max_interval!r}"
+            f"{dataset_name} stride_range must be a (lo, hi) pair, got {stride_range!r}"
+        ) from None
+    if not isinstance(lo, int) or not isinstance(hi, int) or lo < 1 or lo > hi:
+        raise ValueError(
+            f"{dataset_name} stride_range must be ints with 1 <= lo <= hi, "
+            f"got {stride_range!r}"
         )
-    return max_interval
+    return (lo, hi)
 
 
 def intrinsics_rows_to_K(intrins):
@@ -76,6 +86,7 @@ class BaseMultiViewDataset(EasyDataset):
         num_views=None,
         split=None,
         resolution=None,  # square_size or (width, height) or list of [(width,height), ...]
+        stride_range=(1, 1),
         transform=ImgNorm,
         aug_crop=False,
         n_corres=0,
@@ -118,6 +129,21 @@ class BaseMultiViewDataset(EasyDataset):
         self.seed = seed
         self.allow_repeat = allow_repeat
         self.seq_aug_crop = seq_aug_crop
+        # Per-clip frame stride (lo, hi): one stride is drawn uniformly in
+        # [lo, hi] per clip (see get_seq_from_start_id). (1, 1) is exactly
+        # consecutive frames. TEST is pinned to (1, 1): under a stochastic
+        # stride, "adjacent" clip entries can be 20 source frames apart, which
+        # silently turns TAE/frame-scrubbing into cross-view readings.
+        self.stride_range = validate_stride_range(stride_range, type(self).__name__)
+        if self.split == Split.TEST and self.stride_range != (1, 1):
+            raise ValueError(
+                f"{type(self).__name__}: TEST split requires stride_range=(1, 1) "
+                f"-- temporal metrics (TAE, warp consistency) assume consecutive "
+                f"frames; got {self.stride_range}"
+            )
+        # plain attribute (not a property) so diagnostics like
+        # tests/temp_mask_survival.py can flip it for A/B runs
+        self.sequential = self.stride_range == (1, 1)
 
     def min_views(self):
         """Minimum usable frames for a scene: num_views, or the reduced floor
@@ -225,29 +251,52 @@ class BaseMultiViewDataset(EasyDataset):
         id_ref,
         ids_all,
         rng,
-        min_interval=1,
-        max_interval=25,
-        video_prob=0.5,
-        fix_interval_prob=0.5,
+        stride_range=None,
+        video_prob=1.0,
+        fix_interval_prob=1.0,
         block_shuffle=None,
     ):
-        """
+        """Defaults encode the causal-streaming policy, uniform across every
+        dataset (override per-call only if you really mean to):
+          video_prob=1.0, block_shuffle=None -> clips are ALWAYS temporally
+            ordered; out-of-order frames contradict the KV-cache premise.
+          fix_interval_prob=1.0 -> one regular stride per clip (a real frame
+            rate), sampled uniformly in stride_range=[lo, hi]. Random per-clip
+            stride preserves motion-speed augmentation and baseline/parallax
+            diversity while staying deployment-ordered. Keep hi small (~3-5)
+            for near-video; (1, 1) = pure consecutive (the TEST policy,
+            enforced at construction).
         args:
             num_views: number of views to return
             id_ref: the reference id (first id)
             ids_all: all the ids
             rng: random number generator
-            max_interval: maximum interval between two views
+            stride_range: (lo, hi) frame-stride bounds; None -> the dataset's
+                own self.stride_range. Scenes too short for lo fall back to
+                the largest feasible stride.
         returns:
             pos: list of positions of the views in ids_all, i.e., index for ids_all
             is_video: True if the views are consecutive
         """
-        assert min_interval > 0, f"min_interval should be > 0, got {min_interval}"
-        assert min_interval <= max_interval, (
-            f"min_interval should be <= max_interval, got {min_interval} and {max_interval}"
+        if stride_range is None:
+            stride_range = self.stride_range
+        min_interval, max_interval = validate_stride_range(
+            stride_range, type(self).__name__
         )
         assert id_ref in ids_all
         pos_ref = ids_all.index(id_ref)
+
+        # Consecutive mode (stride pinned to exactly 1): temporal order
+        # preserved, no rng draws. The stochastic sampling below is multi-view
+        # augmentation inherited from the dust3r/VGGT recipe -- right for
+        # learning parallax, but it breaks anything assuming pixel-aligned
+        # temporal adjacency: the TGM-style temporal loss, TAE, and the
+        # follow-camera visualization. See self.sequential.
+        if self.sequential and len(ids_all) >= num_views:
+            # slide the window back if it would run off the end of the scene
+            start = min(pos_ref, len(ids_all) - num_views)
+            return [start + i for i in range(num_views)], True
+
         all_possible_pos = np.arange(pos_ref, len(ids_all))
 
         remaining_sum = len(ids_all) - 1 - pos_ref
@@ -256,23 +305,22 @@ class BaseMultiViewDataset(EasyDataset):
             if remaining_sum == num_views - 1:
                 assert ids_all[-num_views] == id_ref
                 return [pos_ref + i for i in range(num_views)], True
+            # cap the stride so the clip fits in the scene, then drop the
+            # floor to match when the scene is too short for the requested
+            # minimum (feasibility beats the configured lower bound)
             max_interval = min(max_interval, 2 * remaining_sum // (num_views - 1))
+            lo = min(min_interval, max_interval)
             intervals = [
-                rng.choice(range(min_interval, max_interval + 1))
-                for _ in range(num_views - 1)
+                rng.choice(range(lo, max_interval + 1)) for _ in range(num_views - 1)
             ]
 
             # if video or collection
             if rng.random() < video_prob:
                 # if fixed interval or random
                 if rng.random() < fix_interval_prob:
-                    # regular interval
-                    fixed_interval = rng.choice(
-                        range(
-                            1,
-                            min(remaining_sum // (num_views - 1) + 1, max_interval + 1),
-                        )
-                    )
+                    # regular interval, feasibility-capped as above
+                    hi = min(remaining_sum // (num_views - 1), max_interval)
+                    fixed_interval = rng.choice(range(min(lo, hi), hi + 1))
                     intervals = [fixed_interval for _ in range(num_views - 1)]
                 is_video = True
             else:
@@ -299,8 +347,11 @@ class BaseMultiViewDataset(EasyDataset):
             new_pos_ref = rng.choice(np.arange(pos_ref + 1))
             new_remaining_sum = len(ids_all) - 1 - new_pos_ref
             new_max_interval = min(max_interval, new_remaining_sum // (uniq_num - 1))
+            # short scene: honor the configured stride floor only when feasible
+            new_lo = max(1, min(min_interval, new_max_interval))
             new_intervals = [
-                rng.choice(range(1, new_max_interval + 1)) for _ in range(uniq_num - 1)
+                rng.choice(range(new_lo, new_max_interval + 1))
+                for _ in range(uniq_num - 1)
             ]
 
             revisit_random = rng.random()
@@ -308,7 +359,7 @@ class BaseMultiViewDataset(EasyDataset):
 
             if rng.random() < fix_interval_prob and video_random < video_prob:
                 # regular interval
-                fixed_interval = rng.choice(range(1, new_max_interval + 1))
+                fixed_interval = rng.choice(range(new_lo, new_max_interval + 1))
                 new_intervals = [fixed_interval for _ in range(uniq_num - 1)]
             pos = list(itertools.accumulate([new_pos_ref] + new_intervals))
 

@@ -8,15 +8,14 @@ from .base.base_multiview_dataset import (
     BaseMultiViewDataset,
     EmptyDatasetError,
     intrinsics_rows_to_K,
-    validate_max_interval,
 )
 from .types import Split
 from .utils.image import imread_cv2
 from .utils.zipio import frames_root
 
-# preserves the original DUSt3R ARKitScenes default; override via the
+# preserves the original DUSt3R ARKitScenes stride cap; override via the
 # constructor or the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 8
+DEFAULT_STRIDE_RANGE = (1, 8)
 
 
 def stratified_sampling(indices, num_samples, rng=None):
@@ -58,7 +57,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
         is_metric=True,
         highres_root=None,
         **kwargs,
@@ -70,8 +69,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         # must exclude; None falls back to the original DUSt3R convention of
         # deriving ROOT + "_highres" (silently skipped when absent)
         self.highres_root = highres_root
-        self.max_interval = validate_max_interval(max_interval, "ARKitScenes")
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, stride_range=stride_range, **kwargs)
         match self.split:
             case Split.TRAIN:
                 self.split_dir = "Training"
@@ -203,11 +201,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                 num_views,
                 start_id,
                 image_idxs.tolist(),
-                rng,
-                max_interval=self.max_interval,
-                video_prob=0.8,
-                fix_interval_prob=0.5,
-                block_shuffle=16,
+                rng,  # stride/order policy: self.stride_range + base defaults
             )
             image_idxs = np.array(image_idxs)[pos]
         else:

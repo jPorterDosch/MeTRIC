@@ -38,6 +38,11 @@ REPO=/oscar/home/jdosch/MeTRIC
 DATA=/oscar/scratch/jdosch/data/processed_hammer
 
 export PATH=/users/jdosch/miniconda3/envs/StreamVGGT/bin:$PATH
+# expandable_segments: avoids fragmentation-class OOMs on L40S, where a small
+# alloc can fail with memory free but non-contiguous. A frozen backbone is NOT
+# immunity -- the token head-only arm OOM'd exactly this way -- so every arm
+# sets it for parity.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # absolute path so sbatch works from any directory; deliberately NOT setting
 # WANDB_RUN_ID/WANDB_RESUME here -- this must never append to the real run
@@ -61,12 +66,12 @@ python finetune_depth.py \
     `# tiny data: 10 train clips per epoch, 5 deterministic val clips`        \
     --train-dataset.root "$DATA" \
     --train-dataset.dataset HAMMER \
-    --train-dataset.max-interval 20 \
+    --train-dataset.stride-range 1 20 \
     --train-dataset.epoch-size 10 \
     --train-dataset.highres-root None \
     --val-dataset.root "$DATA" \
     --val-dataset.dataset HAMMER \
-    --val-dataset.max-interval 20 \
+    --val-dataset.stride-range 1 1 \
     --val-dataset.epoch-size 5 \
     --val-dataset.highres-root None \
     \

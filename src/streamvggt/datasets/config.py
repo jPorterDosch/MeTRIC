@@ -6,14 +6,14 @@ A single :class:`DatasetConfig` fully describes how to construct one dataset
 (combine the built datasets with ``+`` in the entrypoint). DatasetConfig is
 meant to be nested inside a training
 entrypoint's config (see ``finetune_depth.FinetuneDepthCfg``) so tyro exposes
-its fields as ``--dataset.root``, ``--dataset.max-interval`` etc.
+its fields as ``--dataset.root``, ``--dataset.stride-range`` etc.
 
 Design notes:
   * Fail fast. Every field that genuinely identifies the data (root, dataset,
-    num_views, max_interval, resolution) is *required* -- there is no silent
+    num_views, stride_range, resolution) is *required* -- there is no silent
     default that would quietly load the wrong thing. ``validate()`` checks the
     fields up front and each dataset constructor re-checks its own invariants.
-  * No silent overwrite. ``is_metric`` and ``max_interval`` are plumbed through
+  * No silent overwrite. ``is_metric`` and ``stride_range`` are plumbed through
     to the dataset constructors instead of being hardcoded there.
   * No ``eval``. The dataset is selected with a ``match`` over a
     :class:`DatasetName` enum and the transform with a ``match`` over a
@@ -44,7 +44,7 @@ class DatasetConfig:
 
         cfg = DatasetConfig(
             root=Path("/data/processed_hammer"), dataset=DatasetName.HAMMER,
-            num_views=4, max_interval=20, resolution=((518, 518),),
+            num_views=4, stride_range=(1, 20), resolution=((518, 518),),
         )
         dataset = cfg.build()
     """
@@ -56,8 +56,10 @@ class DatasetConfig:
     """Which dataset to build."""
     num_views: int
     """Number of views per sample."""
-    max_interval: int
-    """Maximum frame interval when sampling a view sequence."""
+    stride_range: tuple[int, int]
+    """(lo, hi) frame-stride bounds: one stride is drawn uniformly in
+    [lo, hi] per clip. ``(1, 1)`` = consecutive frames -- required for the
+    TEST split, where temporal metrics assume pixel-aligned adjacency."""
     resolution: tuple[tuple[int, int], ...]
     """One or more (width, height) aspect ratios; a batch is sampled at a
     single resolution, and multiple entries enable aspect-ratio augmentation."""
@@ -104,8 +106,21 @@ class DatasetConfig:
         self.transform = TransformName(self.transform)
         if self.num_views < 1:
             raise ValueError(f"num_views must be >= 1, got {self.num_views}")
-        if self.max_interval < 1:
-            raise ValueError(f"max_interval must be >= 1, got {self.max_interval}")
+        if (
+            len(self.stride_range) != 2
+            or self.stride_range[0] < 1
+            or self.stride_range[0] > self.stride_range[1]
+        ):
+            raise ValueError(
+                f"stride_range must be (lo, hi) with 1 <= lo <= hi, "
+                f"got {self.stride_range!r}"
+            )
+        if self.split is Split.TEST and tuple(self.stride_range) != (1, 1):
+            raise ValueError(
+                f"TEST split requires stride_range=(1, 1) (consecutive frames; "
+                f"temporal metrics assume pixel-aligned adjacency), "
+                f"got {self.stride_range!r}"
+            )
         if not self.resolution:
             raise ValueError("resolution must list at least one (width, height)")
         for wh in self.resolution:
@@ -148,7 +163,7 @@ class DatasetConfig:
             split=self.split,
             num_views=self.num_views,
             resolution=[tuple(wh) for wh in self.resolution],
-            max_interval=self.max_interval,
+            stride_range=tuple(self.stride_range),
             is_metric=self.is_metric,
             aug_crop=self.aug_crop,
             allow_repeat=self.allow_repeat,
@@ -191,7 +206,7 @@ def build_dataset(config: DatasetConfig) -> BaseMultiViewDataset:
 class MultiDatasetConfig:
     """Construct N streamvggt datasets from parallel per-dataset tuples.
 
-    Per-dataset fields (``root``, ``dataset``, ``max_interval``, and optionally
+    Per-dataset fields (``root``, ``dataset``, ``stride_range``, and optionally
     ``epoch_size`` / ``is_metric``) are ordered tuples indexed together: entry
     ``i`` of every tuple describes dataset ``i``. All provided tuples must have
     the same length -- ``validate()`` fails fast on any mismatch. The remaining
@@ -208,7 +223,7 @@ class MultiDatasetConfig:
 
         --dataset.root /data/lowres /data/highres \\
         --dataset.dataset arkitscenes_lowres arkitscenes_highres \\
-        --dataset.max-interval 8 8 --dataset.epoch-size 4500 2250
+        --dataset.stride-range 1 8 1 8 --dataset.epoch-size 4500 2250
     """
 
     # --- per-dataset parallel tuples (equal length, fail fast) ---
@@ -216,8 +231,9 @@ class MultiDatasetConfig:
     """Filesystem root of each preprocessed dataset."""
     dataset: tuple[DatasetName, ...]
     """Which dataset to build at each root."""
-    max_interval: tuple[int, ...]
-    """Per-dataset maximum frame interval when sampling a view sequence."""
+    stride_range: tuple[tuple[int, int], ...]
+    """Per-dataset (lo, hi) frame-stride bounds (one stride drawn uniformly in
+    [lo, hi] per clip; ``(1, 1)`` = consecutive, required for TEST)."""
 
     # --- shared: identical for every dataset ---
     num_views: int
@@ -263,7 +279,7 @@ class MultiDatasetConfig:
             raise ValueError("MultiDatasetConfig needs at least one dataset root")
         for name, values in (
             ("dataset", self.dataset),
-            ("max_interval", self.max_interval),
+            ("stride_range", self.stride_range),
             ("epoch_size", self.epoch_size),
             ("is_metric", self.is_metric),
             ("highres_root", self.highres_root),
@@ -284,7 +300,7 @@ class MultiDatasetConfig:
                 root=self.root[i],
                 dataset=self.dataset[i],
                 num_views=self.num_views,
-                max_interval=self.max_interval[i],
+                stride_range=self.stride_range[i],
                 resolution=self.resolution,
                 split=self.split,
                 is_metric=True if self.is_metric is None else self.is_metric[i],

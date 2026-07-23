@@ -42,6 +42,11 @@ DATA=/oscar/scratch/jdosch/data/processed_hammer
 
 # --- environment: the StreamVGGT conda env has torch/accelerate/tyro etc. ---
 export PATH=/users/jdosch/miniconda3/envs/StreamVGGT/bin:$PATH
+# expandable_segments: avoids fragmentation-class OOMs on L40S, where a small
+# alloc can fail with memory free but non-contiguous. A frozen backbone is NOT
+# immunity -- the token head-only arm OOM'd exactly this way -- so every arm
+# sets it for parity.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source .secrets/wandb-personal.env
 
@@ -75,7 +80,8 @@ python finetune_depth.py \
     \
     `# --- train data: HAMMER only -----------------------------------------` \
     `# dataset takes the DatasetName MEMBER name (HAMMER, not hammer);`       \
-    `# max-interval 20 is the HAMMER loader's own default sampling stride;`   \
+    `# stride-range 1 20 is the HAMMER loader's own default (one random`     \
+    `# per-clip stride in [1, 20]; val is pinned to 1 1 = consecutive);`   \
     `# epoch-size 4500 mirrors the per-dataset slice of the original recipe;` \
     `# highres-root None because that knob only applies to ARKitScenes`       \
     `# lowres (the tyro default carries ARKitScenes entries, so it must be`   \
@@ -85,7 +91,7 @@ python finetune_depth.py \
     `# uses.`                                                                 \
     --train-dataset.root "$DATA" \
     --train-dataset.dataset HAMMER \
-    --train-dataset.max-interval 20 \
+    --train-dataset.stride-range 1 20 \
     --train-dataset.epoch-size 4500 \
     --train-dataset.highres-root None \
     \
@@ -95,7 +101,7 @@ python finetune_depth.py \
     `# 1000 mirrors the original recipe's test slice`                         \
     --val-dataset.root "$DATA" \
     --val-dataset.dataset HAMMER \
-    --val-dataset.max-interval 20 \
+    --val-dataset.stride-range 1 1 \
     --val-dataset.epoch-size 1000 \
     --val-dataset.highres-root None \
     \
