@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --constraint=l40s
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/oscar/home/jdosch/MeTRIC/logs/%x/%j.out
 #SBATCH --error=/oscar/home/jdosch/MeTRIC/logs/%x/%j.out
 
@@ -38,6 +38,11 @@ DATA=/oscar/scratch/jdosch/data/processed_hammer
 
 # --- environment: the StreamVGGT conda env has torch/accelerate/tyro etc. ---
 export PATH=/users/jdosch/miniconda3/envs/StreamVGGT/bin:$PATH
+# expandable_segments: avoids fragmentation-class OOMs on L40S, where a small
+# alloc can fail with memory free but non-contiguous. A frozen backbone is NOT
+# immunity -- the token head-only arm OOM'd exactly this way -- so every arm
+# sets it for parity.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source .secrets/wandb-personal.env
 
@@ -67,14 +72,14 @@ python finetune_depth.py \
     `# --- train data: HAMMER only -----------------------------------------` \
     --train-dataset.root "$DATA" \
     --train-dataset.dataset HAMMER \
-    --train-dataset.max-interval 20 \
+    --train-dataset.stride-range 1 20 \
     --train-dataset.epoch-size 4500 \
     --train-dataset.highres-root None \
     \
     `# --- val data: HAMMER test split -------------------------------------` \
     --val-dataset.root "$DATA" \
     --val-dataset.dataset HAMMER \
-    --val-dataset.max-interval 20 \
+    --val-dataset.stride-range 1 1 \
     --val-dataset.epoch-size 1000 \
     --val-dataset.highres-root None \
     \

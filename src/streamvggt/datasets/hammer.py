@@ -9,9 +9,9 @@ from .base.base_multiview_dataset import BaseMultiViewDataset
 from .types import Split
 from .utils.image import imread_cv2
 
-# preserves the original DUSt3R HAMMER default; override via the constructor or
-# the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 20
+# preserves the original DUSt3R HAMMER stride cap; override via the constructor
+# or the DatasetConfig CLI rather than editing this constant.
+DEFAULT_STRIDE_RANGE = (1, 20)
 
 
 class HAMMER_Multi(BaseMultiViewDataset):
@@ -25,7 +25,8 @@ class HAMMER_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         include_naked=False,
         **kwargs,
@@ -38,12 +39,9 @@ class HAMMER_Multi(BaseMultiViewDataset):
         # geometry is near-trivial and re-walks the object scene's background, so
         # it is excluded by default; pass include_naked=True to keep it.
         self.include_naked = include_naked
-        if not isinstance(max_interval, int) or max_interval < 1:
-            raise ValueError(
-                f"HAMMER max_interval must be a positive int, got {max_interval!r}"
-            )
-        self.max_interval = max_interval
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 subdir = "train"
@@ -99,9 +97,7 @@ class HAMMER_Multi(BaseMultiViewDataset):
                     )
 
             img_ids = list(np.arange(num_imgs) + offset)
-            cut_off = (
-                self.num_views if not self.allow_repeat else max(self.num_views // 3, 3)
-            )
+            cut_off = self.min_views()
             if num_imgs < cut_off:
                 print(f"Skipping {scene}: only {num_imgs} frames < {cut_off} views")
                 continue
@@ -136,15 +132,16 @@ class HAMMER_Multi(BaseMultiViewDataset):
     def _get_views(self, idx, resolution, rng, num_views):
         start_id = self.start_img_ids[idx]
         all_image_ids = self.scene_img_list[self.sceneids[start_id]]
+        # Causal-ordered sampling is centralized in get_seq_from_start_id
+        # (ascending order is an invariant there; one random per-clip stride
+        # drawn from self.stride_range). TODO: still to pick that range and whether to
+        # also adopt VDA's TGM weighting (x10, single scale) -- decide with
+        # tests/temp_mask_survival.py. TEST split is pinned to (1, 1).
         pos, ordered_video = self.get_seq_from_start_id(
             num_views,
             start_id,
             all_image_ids,
             rng,
-            max_interval=self.max_interval,
-            video_prob=0.6,
-            fix_interval_prob=0.6,
-            block_shuffle=16,
         )
         image_idxs = np.array(all_image_ids)[pos]
 

@@ -25,15 +25,19 @@ import os
 from pathlib import Path
 
 import matplotlib
+
+matplotlib.use("Agg")  # headless: heatmap export must work on compute nodes
 import numpy as np
 import torch
 import trimesh
 from accelerate import Accelerator
 
 from dust3r.inference import loss_of_one_batch  # noqa
+from eval.temporal_consistency.metrics import depth2point, point2depth
 from finetune_depth import (
     FinetuneDepthCfg,
     _clip_predictions,
+    _img2lidar,
     _prepare_batch,
     _set_data_epoch,
     _stack_depth_batch,
@@ -109,12 +113,22 @@ def rebuild_metric_cfg(raw: dict) -> MetricCfg:
     ).validate()
 
 
-def rebuild_val_dataset(raw: dict, data_root: str | None) -> MultiDatasetConfig:
+def rebuild_val_dataset(
+    raw: dict, data_root: str | None, dataset: str | None = None
+) -> MultiDatasetConfig:
     """Reconstruct the validation dataset config saved with the run. --data-root
     overrides the on-disk location (useful when the data tree lives somewhere
-    other than the training CWD); it only supports the single-dataset val
-    config finetune_depth.py ships with."""
+    other than the training CWD); --dataset additionally swaps the dataset TYPE
+    (e.g. visualize a HAMMER-finetuned model on scannet/arkitscenes to probe
+    out-of-domain behaviour). Both only support the single-dataset val config
+    finetune_depth.py ships with."""
     vd = dict(raw["val_dataset"])
+    if dataset is not None:
+        if data_root is None:
+            raise ValueError("--dataset requires --data-root (the new tree)")
+        if len(vd["dataset"]) != 1:
+            raise ValueError("--dataset only supports a single-dataset val config")
+        vd["dataset"] = [dataset]
     if data_root is not None:
         if len(vd["root"]) != 1:
             raise ValueError(
@@ -207,11 +221,122 @@ def _per_frame_scene(predictions: dict) -> trimesh.Scene:
             )
         rgba = colormap(i / max(S, 1))
         color = tuple(int(255 * x) for x in rgba[:3])
-        integrate_camera_into_scene(
-            scene, np.linalg.inv(extrinsics_4x4[i]), color, scene_scale
+        cam_to_world = np.linalg.inv(extrinsics_4x4[i])
+        integrate_camera_into_scene(scene, cam_to_world, color, scene_scale)
+        # A marker node carrying the GT cam->world pose VERBATIM, so the viewer
+        # can place its view camera at frame i's real camera. The frustum mesh
+        # can't be used for this: its transform has the OpenGL conversion and a
+        # scene_scale-dependent offset baked in, which the viewer cannot undo.
+        # One point, hidden at load; the scene-wide alignment below applies to
+        # this node exactly as it does to the clouds, so they stay consistent.
+        scene.add_geometry(
+            trimesh.PointCloud(vertices=np.zeros((1, 3), dtype=np.float32)),
+            geom_name=f"campose_{i:03d}",
+            transform=cam_to_world,
         )
 
     return apply_scene_alignment(scene, extrinsics_4x4)
+
+
+# Fixed absolute scale for BOTH relative-error series so base/finetuned panels
+# are directly comparable (a per-image autoscale would make every panel look
+# equally bad). 0.10 = 10% relative error saturates the colormap; val AbsRel is
+# ~0.05, so structure is visible rather than crushed.
+_REL_VMAX = 0.10
+
+
+def _export_heatmaps(
+    hm_dir: str,
+    tag: str,
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    valid: torch.Tensor,
+    K: torch.Tensor,
+    pose: torch.Tensor,
+) -> int:
+    """2D heatmap companions to the GLB export, from the SAME predictions.
+
+    pred/gt/valid: [S,H,W] cpu; K: [S,3,3]; pose: [S,4,4] cam2world. Writes:
+      {tag}_depth_XXX.png     colormapped predicted depth (one shared robust
+                              range across the clip, so brightness is comparable
+                              frame to frame)
+      {tag}_gterr_XXX.png     |pred-gt|/gt where GT is valid (accuracy)
+      {tag}_tcons_XXX.png     adjacent-pair self-consistency: pred[i] warped
+                              into frame i+1 via the GT camera (depth2point /
+                              point2depth -- the exact machinery tae() reduces
+                              to a scalar), then |pred[i+1]-warped|/pred[i+1].
+                              Needs NO ground-truth depth, only poses, so the
+                              same code transfers to captures without GT.
+      {tag}_summary.png       per-frame mean curves of both error series
+    Pixels with no valid comparison are gray. Returns #files written."""
+    import matplotlib.pyplot as plt
+
+    os.makedirs(hm_dir, exist_ok=True)
+    S = pred.shape[0]
+    pred_np = pred.numpy()
+    gt_np = gt.numpy()
+    valid_np = valid.numpy().astype(bool)
+    written = 0
+
+    def save_map(path: str, rel: np.ndarray, ok: np.ndarray) -> None:
+        cmap = matplotlib.colormaps["inferno"]
+        rgba = cmap(np.clip(rel / _REL_VMAX, 0.0, 1.0))
+        rgba[~ok] = (0.5, 0.5, 0.5, 1.0)
+        plt.imsave(path, rgba)
+
+    # --- predicted depth, one robust shared range across the clip ---
+    finite = np.isfinite(pred_np) & (pred_np > 0)
+    lo, hi = np.percentile(pred_np[finite], [2, 98]) if finite.any() else (0.0, 1.0)
+    turbo = matplotlib.colormaps["turbo"]
+    for i in range(S):
+        x = np.clip((pred_np[i] - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        rgba = turbo(x)
+        rgba[~finite[i]] = (0.5, 0.5, 0.5, 1.0)
+        plt.imsave(os.path.join(hm_dir, f"{tag}_depth_{i:03d}.png"), rgba)
+        written += 1
+
+    # --- accuracy vs GT ---
+    gterr_means = []
+    for i in range(S):
+        ok = valid_np[i] & (gt_np[i] > 0) & finite[i]
+        rel = np.zeros_like(pred_np[i])
+        rel[ok] = np.abs(pred_np[i][ok] - gt_np[i][ok]) / gt_np[i][ok]
+        save_map(os.path.join(hm_dir, f"{tag}_gterr_{i:03d}.png"), rel, ok)
+        gterr_means.append(float(rel[ok].mean()) if ok.any() else np.nan)
+        written += 1
+
+    # --- temporal self-consistency (adjacent pairs, GT-depth-free) ---
+    tcons_means = []
+    for i in range(S - 1):
+        il_a, il_b = _img2lidar(K[i], pose[i]), _img2lidar(K[i + 1], pose[i + 1])
+        warped = point2depth(
+            depth2point(pred_np[i], finite[i], il_a),
+            np.ones_like(finite[i + 1], dtype=np.float32),
+            il_b,
+        )
+        ok = (warped > 1e-6) & finite[i + 1]
+        rel = np.zeros_like(pred_np[i + 1])
+        rel[ok] = np.abs(pred_np[i + 1][ok] - warped[ok]) / pred_np[i + 1][ok]
+        save_map(os.path.join(hm_dir, f"{tag}_tcons_{i:03d}.png"), rel, ok)
+        tcons_means.append(float(rel[ok].mean()) if ok.any() else np.nan)
+        written += 1
+
+    fig, ax = plt.subplots(figsize=(7, 3.2), constrained_layout=True)
+    ax.plot(gterr_means, label="|pred-gt|/gt (per frame)", marker="o", ms=3)
+    ax.plot(
+        np.arange(S - 1) + 0.5,
+        tcons_means,
+        label="warp self-consistency (per pair)",
+        marker="s",
+        ms=3,
+    )
+    ax.set_xlabel("frame")
+    ax.set_ylabel("mean relative error")
+    ax.set_title(tag)
+    ax.legend(fontsize=8)
+    fig.savefig(os.path.join(hm_dir, f"{tag}_summary.png"), dpi=150)
+    plt.close(fig)
+    return written + 1
 
 
 def main() -> None:
@@ -260,6 +385,36 @@ def main() -> None:
         default=None,
         help="override the saved val dataset root (single-dataset configs only)",
     )
+    ap.add_argument(
+        "--dataset",
+        default=None,
+        help="swap the val dataset TYPE (e.g. scannet, arkitscenes) to probe "
+        "out-of-domain behaviour; requires --data-root pointing at that "
+        "dataset's processed tree. Sparse conditioning is re-simulated from the "
+        "new dataset's GT, so the pipeline runs unchanged.",
+    )
+    ap.add_argument(
+        "--all-pixels",
+        action="store_true",
+        help="export the model's dense prediction at EVERY pixel instead of only "
+        "where GT depth exists. This is the depth-completion output: predictions "
+        "in GT holes (sensor dropouts, transparent/specular surfaces) are exactly "
+        "what the GT-masked view hides. Files are tagged *_allpx so both views can "
+        "share one --out-dir. Note the prediction is unconstrained in those holes, "
+        "so it may be wild -- compare against the default view before trusting it.",
+    )
+    # NOTE: no --sequential flag. TEST-split datasets require
+    # stride_range=(1, 1) (consecutive frames, enforced at construction),
+    # so cross-view "temporal" readings are not producible by mistake.
+    ap.add_argument(
+        "--heatmaps",
+        action="store_true",
+        help="also write 2D PNG heatmaps per clip to <out-dir>/heatmaps: "
+        "colormapped predicted depth, |pred-gt|/gt accuracy maps, and "
+        "adjacent-pair warp self-consistency maps (the per-pixel field that "
+        "tae() reduces to a scalar), plus a per-frame summary curve. Fixed "
+        "color scale so base/finetuned panels are directly comparable.",
+    )
     ap.add_argument("--num-workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -275,7 +430,7 @@ def main() -> None:
 
     raw = load_saved_args(ckpt)
     mcfg = rebuild_metric_cfg(raw)
-    val_ds = rebuild_val_dataset(raw, args.data_root)
+    val_ds = rebuild_val_dataset(raw, args.data_root, args.dataset)
     if args.num_views is not None:
         # more frames per scene -> longer sequences to scrub. num_views is
         # independent of resolution; the sampler and streaming path handle any
@@ -283,6 +438,10 @@ def main() -> None:
         val_ds.num_views = args.num_views
 
     mode = "base" if args.base else "finetuned"
+    if args.all_pixels:
+        # distinct tag so a GT-masked and an all-pixels export can share one
+        # --out-dir and sit side by side in the viewer's scene dropdown
+        mode += "_allpx"
     out_dir = args.out_dir or str(
         (ckpt_path.parent if ckpt_path.parent != Path("") else Path(".")) / "viz"
     )
@@ -337,6 +496,8 @@ def main() -> None:
         model.load_state_dict(state_dict, strict=True)
     model.eval()
 
+    # TEST-split datasets are sequential by construction, so every export here
+    # is temporally ordered
     loader = build_train_loader(cfg, Split.TEST, accelerator, batch_size=1)
     loader = accelerator.prepare(loader)
     _set_data_epoch(loader, 0)  # deterministic clip set/order (see val_loop)
@@ -370,15 +531,31 @@ def main() -> None:
             confs = _clip_confidences(preds)
             # imgs is not in _stack_depth_batch; stack it the same way
             imgs = torch.stack([v["img"] for v in views], dim=1).float().cpu()
-            pred, _, valid, K, pose = _stack_depth_batch(views, preds)
+            pred, gt, valid, K, pose = _stack_depth_batch(views, preds)
             for b in range(pred.shape[0]):
                 if exported >= args.num_clips:
                     break
                 predictions = _clip_predictions(
-                    imgs[b], pred[b], valid[b], K[b], pose[b]
+                    imgs[b],
+                    pred[b],
+                    valid[b],
+                    K[b],
+                    pose[b],
+                    mask_to_gt=not args.all_pixels,
                 )
                 scene = _per_frame_scene(predictions)
                 scene.export(os.path.join(glb_dir, f"{mode}_clip{exported}.glb"))
+                if args.heatmaps:
+                    n_png = _export_heatmaps(
+                        os.path.join(out_dir, "heatmaps"),
+                        f"{mode}_clip{exported}",
+                        pred[b],
+                        gt[b],
+                        valid[b],
+                        K[b],
+                        pose[b],
+                    )
+                    print(f"  [{mode}] clip {exported}: {n_png} heatmap PNGs")
                 mean_c, min_c, max_c = confs[b]
                 print(
                     f"  [{mode}] clip {exported}: {pred.shape[1]} frames | mean depth "

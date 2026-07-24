@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import trimesh
-import gradio as gr
 import numpy as np
 import matplotlib
 from scipy.spatial.transform import Rotation
@@ -68,16 +67,26 @@ def predictions_to_glb(
     if "Pointmap" in prediction_mode:
         print("Using Pointmap Branch")
         if "world_points" in predictions:
-            pred_world_points = predictions["world_points"]  # No batch dimension to remove
-            pred_world_points_conf = predictions.get("world_points_conf", np.ones_like(pred_world_points[..., 0]))
+            pred_world_points = predictions[
+                "world_points"
+            ]  # No batch dimension to remove
+            pred_world_points_conf = predictions.get(
+                "world_points_conf", np.ones_like(pred_world_points[..., 0])
+            )
         else:
-            print("Warning: world_points not found in predictions, falling back to depth-based points")
+            print(
+                "Warning: world_points not found in predictions, falling back to depth-based points"
+            )
             pred_world_points = predictions["world_points_from_depth"]
-            pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+            pred_world_points_conf = predictions.get(
+                "depth_conf", np.ones_like(pred_world_points[..., 0])
+            )
     else:
         print("Using Depthmap and Camera Branch")
         pred_world_points = predictions["world_points_from_depth"]
-        pred_world_points_conf = predictions.get("depth_conf", np.ones_like(pred_world_points[..., 0]))
+        pred_world_points_conf = predictions.get(
+            "depth_conf", np.ones_like(pred_world_points[..., 0])
+        )
 
     # Get images from predictions
     images = predictions["images"]
@@ -104,7 +113,8 @@ def predictions_to_glb(
             if not os.path.exists("skyseg.onnx"):
                 print("Downloading skyseg.onnx...")
                 download_file_from_url(
-                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx", "skyseg.onnx"
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+                    "skyseg.onnx",
                 )
 
             for i, image_name in enumerate(image_list):
@@ -119,7 +129,9 @@ def predictions_to_glb(
                     # Generate new mask
                     if skyseg_session is None:
                         skyseg_session = onnxruntime.InferenceSession("skyseg.onnx")
-                    sky_mask = segment_sky(image_filepath, skyseg_session, mask_filepath)
+                    sky_mask = segment_sky(
+                        image_filepath, skyseg_session, mask_filepath
+                    )
 
                 # Resize mask to match H×W if needed
                 if sky_mask.shape[0] != H or sky_mask.shape[1] != W:
@@ -164,9 +176,17 @@ def predictions_to_glb(
     if mask_white_bg:
         # Filter out white background pixels (RGB values close to white)
         # Consider pixels white if all RGB values are above 240
-        white_bg_mask = ~((colors_rgb[:, 0] > 240) & (colors_rgb[:, 1] > 240) & (colors_rgb[:, 2] > 240))
+        white_bg_mask = ~(
+            (colors_rgb[:, 0] > 240)
+            & (colors_rgb[:, 1] > 240)
+            & (colors_rgb[:, 2] > 240)
+        )
         conf_mask = conf_mask & white_bg_mask
 
+    # Keep the pre-mask flattened arrays: the masked pair below still drives
+    # scene_scale (unchanged), while these let the cloud be split back into
+    # per-frame geometries when it is added to the scene.
+    vertices_all, colors_all = vertices_3d, colors_rgb
     vertices_3d = vertices_3d[conf_mask]
     colors_rgb = colors_rgb[conf_mask]
 
@@ -187,10 +207,38 @@ def predictions_to_glb(
     # Initialize a 3D scene
     scene_3d = trimesh.Scene()
 
-    # Add point cloud data to the scene
-    point_cloud_data = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
-
-    scene_3d.add_geometry(point_cloud_data)
+    # Add the point cloud as ONE GEOMETRY PER FRAME, named frame_000, frame_001,
+    # ... so the frame slider / play / accumulate controls in serve_glb.py
+    # activate (it groups nodes matching /^frame_(\d+)/).
+    #
+    # The split is purely presentational: conf_threshold above is still the
+    # GLOBAL percentile over every frame, so exactly the same points survive as
+    # when the cloud was written fused -- only the grouping changes. Grouping is
+    # what makes drift legible: a fused cloud is the union of all frames and
+    # cannot change as you step through them, so per-frame nodes are required to
+    # see whether later frames land on the same surfaces as earlier ones.
+    n_frames = pred_world_points.shape[0]
+    if conf_mask.any():
+        verts_by_frame = vertices_all.reshape(n_frames, -1, 3)
+        colors_by_frame = colors_all.reshape(n_frames, -1, 3)
+        mask_by_frame = conf_mask.reshape(n_frames, -1)
+        for i in range(n_frames):
+            frame_mask = mask_by_frame[i]
+            if not frame_mask.any():
+                continue  # every point in this frame was filtered out
+            scene_3d.add_geometry(
+                trimesh.PointCloud(
+                    vertices=verts_by_frame[i][frame_mask],
+                    colors=colors_by_frame[i][frame_mask],
+                ),
+                node_name=f"frame_{i:03d}",
+            )
+    else:
+        # Nothing survived the mask: keep the single placeholder-point behaviour
+        # (vertices_3d/colors_rgb were replaced with the dummy point above).
+        scene_3d.add_geometry(
+            trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+        )
 
     # Prepare 4x4 matrices for camera extrinsics
     num_cameras = len(camera_matrices)
@@ -206,7 +254,9 @@ def predictions_to_glb(
             rgba_color = colormap(i / num_cameras)
             current_color = tuple(int(255 * x) for x in rgba_color[:3])
 
-            integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
+            integrate_camera_into_scene(
+                scene_3d, camera_to_world, current_color, scene_scale
+            )
 
     # Align scene to the observation of the first camera
     scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices)
@@ -265,7 +315,9 @@ def integrate_camera_into_scene(
     scene.add_geometry(camera_mesh)
 
 
-def apply_scene_alignment(scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarray) -> trimesh.Scene:
+def apply_scene_alignment(
+    scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarray
+) -> trimesh.Scene:
     """
     Aligns the 3D scene based on the extrinsics of the first camera.
 
@@ -284,7 +336,11 @@ def apply_scene_alignment(scene_3d: trimesh.Scene, extrinsics_matrices: np.ndarr
     align_rotation[:3, :3] = Rotation.from_euler("y", 180, degrees=True).as_matrix()
 
     # Apply transformation
-    initial_transformation = np.linalg.inv(extrinsics_matrices[0]) @ opengl_conversion_matrix @ align_rotation
+    initial_transformation = (
+        np.linalg.inv(extrinsics_matrices[0])
+        @ opengl_conversion_matrix
+        @ align_rotation
+    )
     scene_3d.apply_transform(initial_transformation)
     return scene_3d
 
@@ -306,7 +362,9 @@ def get_opengl_conversion_matrix() -> np.ndarray:
     return matrix
 
 
-def transform_points(transformation: np.ndarray, points: np.ndarray, dim: int = None) -> np.ndarray:
+def transform_points(
+    transformation: np.ndarray, points: np.ndarray, dim: int = None
+) -> np.ndarray:
     """
     Applies a 4x4 transformation to a set of points.
 
@@ -323,7 +381,9 @@ def transform_points(transformation: np.ndarray, points: np.ndarray, dim: int = 
     dim = dim or points.shape[-1]
 
     # Apply transformation
-    transformation = transformation.swapaxes(-1, -2)  # Transpose the transformation matrix
+    transformation = transformation.swapaxes(
+        -1, -2
+    )  # Transpose the transformation matrix
     points = points @ transformation[..., :-1, :] + transformation[..., -1:, :]
 
     # Reshape the result

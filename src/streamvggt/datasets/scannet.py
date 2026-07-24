@@ -9,9 +9,9 @@ from .base.base_multiview_dataset import BaseMultiViewDataset, EmptyDatasetError
 from .types import Split
 from .utils.image import imread_cv2
 
-# preserves the original DUSt3R ScanNet default; override via the constructor or
-# the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 30
+# preserves the original DUSt3R ScanNet stride cap; override via the constructor
+# or the DatasetConfig CLI rather than editing this constant.
+DEFAULT_STRIDE_RANGE = (1, 30)
 
 
 class ScanNet_Multi(BaseMultiViewDataset):
@@ -24,19 +24,17 @@ class ScanNet_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        if not isinstance(max_interval, int) or max_interval < 1:
-            raise ValueError(
-                f"ScanNet max_interval must be a positive int, got {max_interval!r}"
-            )
-        self.max_interval = max_interval
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 subdir = "scans_train"
@@ -77,11 +75,7 @@ class ScanNet_Multi(BaseMultiViewDataset):
                 basenames = data["images"]
                 num_imgs = len(basenames)
                 img_ids = list(np.arange(num_imgs) + offset)
-                cut_off = (
-                    self.num_views
-                    if not self.allow_repeat
-                    else max(self.num_views // 3, 3)
-                )
+                cut_off = self.min_views()
                 start_img_ids_ = img_ids[: num_imgs - cut_off + 1]
 
                 if num_imgs < cut_off:
@@ -121,11 +115,7 @@ class ScanNet_Multi(BaseMultiViewDataset):
             num_views,
             start_id,
             all_image_ids,
-            rng,
-            max_interval=self.max_interval,
-            video_prob=0.6,
-            fix_interval_prob=0.6,
-            block_shuffle=16,
+            rng,  # stride/order policy: self.stride_range + base defaults
         )
         image_idxs = np.array(all_image_ids)[pos]
 

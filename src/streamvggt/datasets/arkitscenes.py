@@ -8,15 +8,14 @@ from .base.base_multiview_dataset import (
     BaseMultiViewDataset,
     EmptyDatasetError,
     intrinsics_rows_to_K,
-    validate_max_interval,
 )
 from .types import Split
 from .utils.image import imread_cv2
 from .utils.zipio import frames_root
 
-# preserves the original DUSt3R ARKitScenes default; override via the
+# preserves the original DUSt3R ARKitScenes stride cap; override via the
 # constructor or the DatasetConfig CLI rather than editing this constant.
-DEFAULT_MAX_INTERVAL = 8
+DEFAULT_STRIDE_RANGE = (1, 8)
 
 
 def stratified_sampling(indices, num_samples, rng=None):
@@ -58,7 +57,8 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         highres_root=None,
         **kwargs,
@@ -70,8 +70,9 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         # must exclude; None falls back to the original DUSt3R convention of
         # deriving ROOT + "_highres" (silently skipped when absent)
         self.highres_root = highres_root
-        self.max_interval = validate_max_interval(max_interval, "ARKitScenes")
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 self.split_dir = "Training"
@@ -194,23 +195,37 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
         return len(self.images)
 
     def _get_views(self, idx, resolution, rng, num_views):
-        if rng.choice([True, False]):
+        # ARKitScenes lowres has TWO samplers: the temporal one (below) and the
+        # pairs/`groups` one (the else branch), which draws a spatial collection
+        # and permutes it -- it never calls get_seq_from_start_id, so the
+        # stride/order policy does not reach it. Under self.sequential that
+        # branch would silently hand back out-of-order frames and break the
+        # consecutive-frame guarantee the TEST split is validated for, so take
+        # the temporal branch unconditionally there (short-circuits before the
+        # coin flip, so no rng draw is consumed either).
+        if self.sequential or rng.choice([True, False]):
             image_idxs = np.arange(self.id_ranges[idx][0], self.id_ranges[idx][1])
-            cut_off = num_views if not self.allow_repeat else max(num_views // 3, 3)
-            start_image_idxs = image_idxs[: len(image_idxs) - cut_off + 1]
+            # nview from the batched sampler can be < self.num_views, so cut on
+            # the ACTUAL clip length; min_views() is the scene-level floor
+            start_image_idxs = image_idxs[: len(image_idxs) - num_views + 1]
             start_id = rng.choice(start_image_idxs)
             pos, ordered_video = self.get_seq_from_start_id(
                 num_views,
                 start_id,
                 image_idxs.tolist(),
-                rng,
-                max_interval=self.max_interval,
-                video_prob=0.8,
-                fix_interval_prob=0.5,
-                block_shuffle=16,
+                rng,  # stride/order policy: self.stride_range + base defaults
             )
             image_idxs = np.array(image_idxs)[pos]
         else:
+            # The `groups` sampler: a co-visible COLLECTION rather than a time
+            # window -- wide baselines and irregular gaps, which is the point of
+            # having two samplers here. The random draw picks WHICH frames; it
+            # must not pick their order, so the result is sorted back into
+            # capture order (groups are built sorted; permutation is what
+            # destroyed it). Same invariant get_seq_from_start_id enforces:
+            # a causal KV cache cannot be fed a clip that jumps back in time.
+            # ordered_video stays False -- ordered, but not a video: the gaps
+            # are arbitrary, so temporal losses/metrics must not treat it as one.
             ordered_video = False
             image_idxs = self.groups[idx]
             image_idxs = rng.permutation(image_idxs)
@@ -222,6 +237,7 @@ class ARKitScenes_Multi(BaseMultiViewDataset):
                 else:
                     repeat_num = num_views // len(image_idxs) + 1
                     image_idxs = np.tile(image_idxs, repeat_num)[:num_views]
+            image_idxs = np.sort(image_idxs)
 
         views = []
         for v, view_idx in enumerate(image_idxs):

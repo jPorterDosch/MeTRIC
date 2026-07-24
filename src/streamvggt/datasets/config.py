@@ -6,14 +6,14 @@ A single :class:`DatasetConfig` fully describes how to construct one dataset
 (combine the built datasets with ``+`` in the entrypoint). DatasetConfig is
 meant to be nested inside a training
 entrypoint's config (see ``finetune_depth.FinetuneDepthCfg``) so tyro exposes
-its fields as ``--dataset.root``, ``--dataset.max-interval`` etc.
+its fields as ``--dataset.root``, ``--dataset.stride-range`` etc.
 
 Design notes:
   * Fail fast. Every field that genuinely identifies the data (root, dataset,
-    num_views, max_interval, resolution) is *required* -- there is no silent
+    num_views, stride_range, resolution) is *required* -- there is no silent
     default that would quietly load the wrong thing. ``validate()`` checks the
     fields up front and each dataset constructor re-checks its own invariants.
-  * No silent overwrite. ``is_metric`` and ``max_interval`` are plumbed through
+  * No silent overwrite. ``is_metric`` and ``stride_range`` are plumbed through
     to the dataset constructors instead of being hardcoded there.
   * No ``eval``. The dataset is selected with a ``match`` over a
     :class:`DatasetName` enum and the transform with a ``match`` over a
@@ -28,7 +28,7 @@ from typing import Optional
 
 from .arkitscenes import ARKitScenes_Multi
 from .arkitscenes_highres import ARKitScenesHighRes_Multi
-from .base.base_multiview_dataset import BaseMultiViewDataset
+from .base.base_multiview_dataset import BaseMultiViewDataset, validate_stride_range
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
 from .hypersim import HyperSim_Multi
@@ -44,7 +44,7 @@ class DatasetConfig:
 
         cfg = DatasetConfig(
             root=Path("/data/processed_hammer"), dataset=DatasetName.HAMMER,
-            num_views=4, max_interval=20, resolution=((518, 518),),
+            num_views=4, stride_range=(1, 20), resolution=((518, 518),),
         )
         dataset = cfg.build()
     """
@@ -56,8 +56,10 @@ class DatasetConfig:
     """Which dataset to build."""
     num_views: int
     """Number of views per sample."""
-    max_interval: int
-    """Maximum frame interval when sampling a view sequence."""
+    stride_range: tuple[int, int]
+    """(lo, hi) frame-stride bounds: one stride is drawn uniformly in
+    [lo, hi] per clip. ``(1, 1)`` = consecutive frames -- required for the
+    TEST split, where temporal metrics assume pixel-aligned adjacency."""
     resolution: tuple[tuple[int, int], ...]
     """One or more (width, height) aspect ratios; a batch is sampled at a
     single resolution, and multiple entries enable aspect-ratio augmentation."""
@@ -69,8 +71,11 @@ class DatasetConfig:
     """Whether the depth/pose are in metric scale."""
     aug_crop: int = 0
     """Random crop augmentation budget in pixels (0 disables it)."""
-    allow_repeat: bool = False
-    """Allow repeating frames to reach ``num_views`` in short sequences."""
+    regular_stride: bool = True
+    """``True``: one stride per clip, i.e. a constant frame rate. ``False``:
+    gaps drawn independently per adjacent pair, so the rate varies within the
+    clip. An ablation axis, hence a config choice rather than a per-sample coin
+    flip; a no-op when ``stride_range`` has ``lo == hi``."""
     seq_aug_crop: bool = False
     """Use one shared crop delta across a sampled sequence."""
     n_corres: int = 0
@@ -104,8 +109,16 @@ class DatasetConfig:
         self.transform = TransformName(self.transform)
         if self.num_views < 1:
             raise ValueError(f"num_views must be >= 1, got {self.num_views}")
-        if self.max_interval < 1:
-            raise ValueError(f"max_interval must be >= 1, got {self.max_interval}")
+        # one shared guard (see base_multiview_dataset): a scalar left over from
+        # the max_interval spelling, a reversed pair, or a numpy int from a
+        # sweep all fail here with the same message the constructors give
+        self.stride_range = validate_stride_range(self.stride_range, "DatasetConfig")
+        if self.split is Split.TEST and self.stride_range != (1, 1):
+            raise ValueError(
+                f"TEST split requires stride_range=(1, 1) (consecutive frames; "
+                f"temporal metrics assume pixel-aligned adjacency), "
+                f"got {self.stride_range!r}"
+            )
         if not self.resolution:
             raise ValueError("resolution must list at least one (width, height)")
         for wh in self.resolution:
@@ -148,10 +161,10 @@ class DatasetConfig:
             split=self.split,
             num_views=self.num_views,
             resolution=[tuple(wh) for wh in self.resolution],
-            max_interval=self.max_interval,
+            stride_range=self.stride_range,  # normalized by validate() above
+            regular_stride=self.regular_stride,
             is_metric=self.is_metric,
             aug_crop=self.aug_crop,
-            allow_repeat=self.allow_repeat,
             seq_aug_crop=self.seq_aug_crop,
             n_corres=self.n_corres,
             nneg=self.nneg,
@@ -191,7 +204,7 @@ def build_dataset(config: DatasetConfig) -> BaseMultiViewDataset:
 class MultiDatasetConfig:
     """Construct N streamvggt datasets from parallel per-dataset tuples.
 
-    Per-dataset fields (``root``, ``dataset``, ``max_interval``, and optionally
+    Per-dataset fields (``root``, ``dataset``, ``stride_range``, and optionally
     ``epoch_size`` / ``is_metric``) are ordered tuples indexed together: entry
     ``i`` of every tuple describes dataset ``i``. All provided tuples must have
     the same length -- ``validate()`` fails fast on any mismatch. The remaining
@@ -208,7 +221,7 @@ class MultiDatasetConfig:
 
         --dataset.root /data/lowres /data/highres \\
         --dataset.dataset arkitscenes_lowres arkitscenes_highres \\
-        --dataset.max-interval 8 8 --dataset.epoch-size 4500 2250
+        --dataset.stride-range 1 8 1 8 --dataset.epoch-size 4500 2250
     """
 
     # --- per-dataset parallel tuples (equal length, fail fast) ---
@@ -216,8 +229,9 @@ class MultiDatasetConfig:
     """Filesystem root of each preprocessed dataset."""
     dataset: tuple[DatasetName, ...]
     """Which dataset to build at each root."""
-    max_interval: tuple[int, ...]
-    """Per-dataset maximum frame interval when sampling a view sequence."""
+    stride_range: tuple[tuple[int, int], ...]
+    """Per-dataset (lo, hi) frame-stride bounds (one stride drawn uniformly in
+    [lo, hi] per clip; ``(1, 1)`` = consecutive, required for TEST)."""
 
     # --- shared: identical for every dataset ---
     num_views: int
@@ -240,7 +254,11 @@ class MultiDatasetConfig:
     # --- shared, optional ---
     split: Split = Split.TRAIN
     aug_crop: int = 0
-    allow_repeat: bool = False
+    regular_stride: bool = True
+    """Shared across the mixture (see ``DatasetConfig.regular_stride``): the
+    regular/irregular choice is a property of the training objective, not of an
+    individual dataset's capture rate -- that is what ``stride_range`` is for,
+    which is why only that one is per-dataset."""
     seq_aug_crop: bool = False
     n_corres: int = 0
     nneg: int = 0
@@ -263,7 +281,7 @@ class MultiDatasetConfig:
             raise ValueError("MultiDatasetConfig needs at least one dataset root")
         for name, values in (
             ("dataset", self.dataset),
-            ("max_interval", self.max_interval),
+            ("stride_range", self.stride_range),
             ("epoch_size", self.epoch_size),
             ("is_metric", self.is_metric),
             ("highres_root", self.highres_root),
@@ -284,12 +302,12 @@ class MultiDatasetConfig:
                 root=self.root[i],
                 dataset=self.dataset[i],
                 num_views=self.num_views,
-                max_interval=self.max_interval[i],
+                stride_range=self.stride_range[i],
                 resolution=self.resolution,
                 split=self.split,
                 is_metric=True if self.is_metric is None else self.is_metric[i],
                 aug_crop=self.aug_crop,
-                allow_repeat=self.allow_repeat,
+                regular_stride=self.regular_stride,
                 seq_aug_crop=self.seq_aug_crop,
                 n_corres=self.n_corres,
                 nneg=self.nneg,

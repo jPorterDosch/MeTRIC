@@ -9,13 +9,13 @@ Checks, in order:
      and the config / package entrypoints contain no eval();
   2. registration + exports: the package exposes the datasets, config, enums and
      data-loader factory, and DatasetName covers exactly the built datasets;
-  3. fail-fast: bad max_interval / bad split / missing root raise, not fall back;
+  3. fail-fast: bad stride_range / bad split / missing root raise, not fall back;
   4. enum coercion + tyro CLI: plain strings coerce to enum members, and a
      command line (with member-name choices) parses into the expected config;
   5. view contract (data-dependent, skipped if the ROOT is absent): every field
      the loss/conditioning code touches exists with the right dtype/shape,
      img in [-1, 1], float32 finite depth, finite cam2world pose, ray_map, ...;
-  6. no silent overwrite: max_interval / is_metric passed via the config are the
+  6. no silent overwrite: stride_range / is_metric passed via the config are the
      values the constructed dataset actually uses;
   7. multi-dataset config: parallel-tuple fan-out puts entry i of every tuple
      into DatasetConfig i, and any tuple-length mismatch fails fast.
@@ -61,13 +61,13 @@ REQUIRED_VIEW_KEYS = [
     "instance",
 ]
 
-# (DatasetName, sub-path under DATA_DIR, canonical max_interval)
+# (DatasetName, sub-path under DATA_DIR, canonical stride_range)
 DATA_CASES = [
-    (DatasetName.HAMMER, "processed_hammer", 20),
-    (DatasetName.ARKITSCENES_LOWRES, "processed_arkitscenes", 8),
-    (DatasetName.ARKITSCENES_HIGHRES, "processed_arkitscenes_highres", 8),
-    (DatasetName.SCANNET, "processed_scannet", 30),
-    (DatasetName.HYPERSIM, "processed_hypersim", 4),
+    (DatasetName.HAMMER, "processed_hammer", (1, 20)),
+    (DatasetName.ARKITSCENES_LOWRES, "processed_arkitscenes", (1, 8)),
+    (DatasetName.ARKITSCENES_HIGHRES, "processed_arkitscenes_highres", (1, 8)),
+    (DatasetName.SCANNET, "processed_scannet", (1, 30)),
+    (DatasetName.HYPERSIM, "processed_hypersim", (1, 4)),
 ]
 
 
@@ -123,16 +123,43 @@ def check_registration():
 
 def check_fail_fast():
     root = Path(ROOT)  # exists, so we reach the constructor-level checks
-    # bad max_interval (config.validate)
+    # bad stride_range (config.validate): lo < 1 and lo > hi
+    for bad_stride in ((0, 5), (5, 2)):
+        try:
+            DatasetConfig(
+                root=root,
+                dataset=DatasetName.HAMMER,
+                num_views=4,
+                stride_range=bad_stride,
+                resolution=((518, 518),),
+            ).build()
+            raise AssertionError(f"bad stride_range {bad_stride} did not raise")
+        except ValueError:
+            pass
+    # TEST split demands consecutive frames (stride_range=(1, 1)): temporal
+    # metrics assume pixel-aligned adjacency, so a stochastic stride raises
+    # both at config validation and at dataset construction
     try:
         DatasetConfig(
             root=root,
             dataset=DatasetName.HAMMER,
             num_views=4,
-            max_interval=0,
+            stride_range=(1, 20),
             resolution=((518, 518),),
+            split=Split.TEST,
         ).build()
-        raise AssertionError("bad max_interval did not raise")
+        raise AssertionError("TEST + stride_range != (1, 1) did not raise")
+    except ValueError:
+        pass
+    try:
+        D.ScanNet_Multi(
+            ROOT=str(root),
+            split=Split.TEST,
+            num_views=4,
+            resolution=[(518, 518)],
+            stride_range=(1, 30),
+        )
+        raise AssertionError("constructor TEST + stride != (1, 1) did not raise")
     except ValueError:
         pass
     # missing root (config.validate)
@@ -141,7 +168,7 @@ def check_fail_fast():
             root=Path("/no/such/root"),
             dataset=DatasetName.HAMMER,
             num_views=4,
-            max_interval=20,
+            stride_range=(1, 20),
             resolution=((518, 518),),
         ).build()
         raise AssertionError("missing root did not raise")
@@ -154,12 +181,15 @@ def check_fail_fast():
             split="trian",
             num_views=4,
             resolution=[(518, 518)],
-            max_interval=30,
+            stride_range=(1, 30),
         )
         raise AssertionError("typo split did not raise")
     except ValueError:
         pass
-    print("  [3] fail-fast: bad max_interval / missing root / bad split all raise")
+    print(
+        "  [3] fail-fast: bad stride_range / TEST non-consecutive / "
+        "missing root / bad split all raise"
+    )
 
 
 def check_enum_and_cli():
@@ -168,7 +198,7 @@ def check_enum_and_cli():
         root=Path(ROOT),
         dataset="hammer",
         num_views=4,
-        max_interval=5,
+        stride_range=(1, 5),
         resolution=((518, 518),),
         split="train",
         transform="imgnorm",
@@ -187,7 +217,10 @@ def check_enum_and_cli():
         "ARKITSCENES_LOWRES",
         "--num-views",
         "6",
-        "--max-interval",
+        # parse-only: validate() would demand (1, 1) for the TEST split below;
+        # here we only check the pair lands as one (lo, hi) tuple
+        "--stride-range",
+        "2",
         "11",
         "--resolution",
         "512",
@@ -202,7 +235,7 @@ def check_enum_and_cli():
     ]
     parsed = tyro.cli(DatasetConfig, args=argv)
     assert parsed.dataset is DatasetName.ARKITSCENES_LOWRES
-    assert parsed.num_views == 6 and parsed.max_interval == 11
+    assert parsed.num_views == 6 and parsed.stride_range == (2, 11)
     assert parsed.resolution == ((512, 384), (256, 256))
     assert parsed.split is Split.TEST and parsed.is_metric is False
     assert parsed.transform is TransformName.SEQ_COLOR_JITTER
@@ -215,7 +248,7 @@ def check_multi_config():
     mc = MultiDatasetConfig(
         root=(Path(ROOT), Path(ROOT)),
         dataset=("arkitscenes_lowres", "arkitscenes_highres"),
-        max_interval=(8, 12),
+        stride_range=((1, 8), (1, 12)),
         epoch_size=(100, 50),
         num_views=4,
         resolution=((518, 518),),
@@ -226,7 +259,7 @@ def check_multi_config():
         DatasetName.ARKITSCENES_LOWRES,
         DatasetName.ARKITSCENES_HIGHRES,
     ]
-    assert [c.max_interval for c in cfgs] == [8, 12]
+    assert [c.stride_range for c in cfgs] == [(1, 8), (1, 12)]
     assert [c.epoch_size for c in cfgs] == [100, 50]
     assert all(c.num_views == 4 and c.is_metric is True for c in cfgs)
     assert all(c.transform is TransformName.SEQ_COLOR_JITTER for c in cfgs)
@@ -235,7 +268,7 @@ def check_multi_config():
     mc_min = MultiDatasetConfig(
         root=(Path(ROOT),),
         dataset=(DatasetName.HAMMER,),
-        max_interval=(20,),
+        stride_range=((1, 20),),
         num_views=4,
         resolution=((518, 518),),
     )
@@ -245,14 +278,14 @@ def check_multi_config():
     # fail-fast: any parallel-tuple length mismatch raises before any build
     for bad in (
         dict(dataset=(DatasetName.HAMMER,)),
-        dict(max_interval=(8,)),
+        dict(stride_range=((1, 8),)),
         dict(epoch_size=(100,)),
         dict(is_metric=(True,)),
     ):
         kwargs = dict(
             root=(Path(ROOT), Path(ROOT)),
             dataset=(DatasetName.HAMMER, DatasetName.SCANNET),
-            max_interval=(20, 30),
+            stride_range=((1, 20), (1, 30)),
             num_views=4,
             resolution=((518, 518),),
         )
@@ -267,7 +300,7 @@ def check_multi_config():
         MultiDatasetConfig(
             root=(),
             dataset=(),
-            max_interval=(),
+            stride_range=(),
             num_views=4,
             resolution=((518, 518),),
         ).validate()
@@ -304,7 +337,7 @@ def check_multi_config():
 def check_view_contract(data_dir):
     ran = 0
     empty_roots = []
-    for dsname, subdir, max_interval in DATA_CASES:
+    for dsname, subdir, stride_range in DATA_CASES:
         root = data_dir / subdir
         if not root.exists():
             print(f"  [5] {dsname.name}: SKIP (no data at {root})")
@@ -313,7 +346,7 @@ def check_view_contract(data_dir):
             root=root,
             dataset=dsname,
             num_views=4,
-            max_interval=max_interval,
+            stride_range=stride_range,
             resolution=((518, 518),),
             split=Split.TRAIN,
             seed=42,
@@ -330,7 +363,7 @@ def check_view_contract(data_dir):
             print(f"  [5] {dsname.name}: SKIP ({e})")
             continue
         # no silent overwrite
-        assert ds.max_interval == max_interval and ds.is_metric is True
+        assert ds.stride_range == stride_range and ds.is_metric is True
         views = ds[0]
         assert len(views) == 4
         for view in views:

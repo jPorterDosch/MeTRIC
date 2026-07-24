@@ -4,12 +4,11 @@ import os.path as osp
 import cv2
 import numpy as np
 
-from .arkitscenes import DEFAULT_MAX_INTERVAL
+from .arkitscenes import DEFAULT_STRIDE_RANGE
 from .base.base_multiview_dataset import (
     BaseMultiViewDataset,
     EmptyDatasetError,
     intrinsics_rows_to_K,
-    validate_max_interval,
 )
 from .types import Split
 from .utils.image import imread_cv2
@@ -34,15 +33,17 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
         self,
         *args,
         ROOT,
-        max_interval=DEFAULT_MAX_INTERVAL,
+        stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        self.max_interval = validate_max_interval(max_interval, "ARKitScenesHighRes")
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 self.split_dir = "Training"
@@ -148,9 +149,7 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
             num_views,
             start_id,
             all_image_ids,
-            rng,
-            max_interval=self.max_interval,
-            block_shuffle=16,
+            rng,  # stride/order policy: self.stride_range + base defaults
         )
         image_idxs = np.array(all_image_ids)[pos]
 

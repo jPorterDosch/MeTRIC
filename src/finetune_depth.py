@@ -139,7 +139,7 @@ class FinetuneDepthCfg:
                 DatasetName.ARKITSCENES_LOWRES,
                 DatasetName.ARKITSCENES_HIGHRES,
             ),
-            max_interval=(8, 8),
+            stride_range=((1, 8), (1, 8)),
             epoch_size=(4500, 2250),
             # the lowres loader excludes the highres tree's scenes; pass the
             # real root explicitly so the partition cannot silently break if
@@ -170,7 +170,9 @@ class FinetuneDepthCfg:
         default_factory=lambda: MultiDatasetConfig(
             root=(Path("/gpfs/data/jtompki1/cli277/metric/processed_scannet"),),
             dataset=(DatasetName.SCANNET,),
-            max_interval=(30,),
+            # TEST split must be (1, 1): consecutive frames, enforced by
+            # DatasetConfig.validate() and the dataset constructors
+            stride_range=((1, 1),),
             epoch_size=(1000,),
             num_views=4,
             resolution=((518, 392),),
@@ -276,6 +278,11 @@ def build_train_loader(
             val_dataset = (
                 val_datasets[0] if len(val_datasets) == 1 else CatDataset(val_datasets)
             )
+            # Evaluation always uses consecutive frames: TEST-split datasets
+            # require stride_range=(1, 1) (enforced at config validation and
+            # dataset construction), so every dataset built here is temporal
+            # by birth -- no loader-side forcing, and cross-view "temporal"
+            # metrics are unrepresentable.
             # shuffle=True is still deterministic here: every draw in
             # CustomRandomSampler comes from a rng seeded by the epoch number
             # (epoch + 788), and ResizedDataset's 1000-slot mapping from
@@ -481,6 +488,7 @@ def run(
                 args=args,
                 mcfg=mcfg,
                 prefix=f"val/{_dataset_tag(args.val_dataset)}",
+                export_glb=args.export_glb and is_last_epoch,
             )
             # Select "best" on metric AbsRel, NOT the criterion loss. The
             # confidence-regularized loss (-alpha*log sigma) is not monotonic
@@ -500,6 +508,27 @@ def run(
     printer.info(
         "Training time {}".format(str(datetime.timedelta(seconds=int(total_time))))
     )
+
+    # epochs == 0 --> pure-eval run: the loop above never reached a val pass,
+    # so run ONE here. Two uses: baseline eval (no --resume: the model is the
+    # pretrained backbone, all conditioning zero-init) and checkpoint re-eval
+    # (--resume checkpoint-best.pth: rescore an arm under the current eval
+    # protocol, e.g. after the sequential-sampling change). step=0 keeps it
+    # below/at the streaming_eval step so wandb drops neither. This IS the only
+    # val pass, so it is the one that exports GLBs when asked.
+    if args.epochs == 0 and data_loader_val is not None:
+        val_loop(
+            model,
+            train_criterion,
+            data_loader_val,
+            accelerator,
+            0,
+            step=0,
+            args=args,
+            mcfg=mcfg,
+            prefix=f"val/{_dataset_tag(args.val_dataset)}",
+            export_glb=args.export_glb,
+        )
 
     # final causal evaluation on the deployment (per-frame KV-cache) path.
     if data_loader_stream is not None:
@@ -695,6 +724,7 @@ def _clip_predictions(
     valid: torch.Tensor,
     K: torch.Tensor,
     pose: torch.Tensor,
+    mask_to_gt: bool = True,
 ) -> dict:
     """Assemble the numpy `predictions` dict predictions_to_glb consumes, for a
     single clip. Inputs are the per-clip slices of _stack_depth_batch plus the
@@ -707,7 +737,16 @@ def _clip_predictions(
     -- so we invert the cam2world pose ONCE and hand the same array to both;
     point cloud and cameras then live in one frame. Invalid pixels get zero
     confidence, which predictions_to_glb's conf>1e-5 filter drops (paired with
-    conf_thres=0.0, so no valid pixels are thresholded out)."""
+    conf_thres=0.0, so no valid pixels are thresholded out).
+
+    mask_to_gt=True (default) keeps only pixels with GT depth, which is what the
+    training-time export wants: the cloud then covers exactly the pixels the
+    logged metrics are computed over. Pass False for inference/visualization of
+    a depth-COMPLETION model -- the prediction in GT holes (sensor dropouts,
+    transparent/specular surfaces) is the completion output, and masking to GT
+    hides precisely the part you cannot read off the metrics. isfinite is
+    applied either way: a NaN/Inf would survive the conf>1e-5 filter and poison
+    the np.percentile scene scale (-> NaN camera sizing for the whole clip)."""
     world2cam = np.linalg.inv(pose.numpy())[:, :3, :4].astype(np.float32)  # [S,3,4]
     # the unprojector does a hard np.squeeze(-1) per frame, so it needs the
     # trailing singleton (_stack_depth_batch already dropped it -> [S,H,W])
@@ -718,7 +757,8 @@ def _clip_predictions(
     # matters: a NaN/Inf predicted depth (bad/early ckpt) at a GT-valid pixel
     # would survive predictions_to_glb's conf>1e-5 filter and poison the
     # np.percentile scene-scale (-> NaN camera sizing for the whole clip).
-    conf = (valid & torch.isfinite(depth)).numpy().astype(np.float32)
+    finite = torch.isfinite(depth)
+    conf = ((valid & finite) if mask_to_gt else finite).numpy().astype(np.float32)
     return {
         "world_points_from_depth": world_points,
         "depth_conf": conf,
@@ -1022,10 +1062,15 @@ def val_loop(
     args: FinetuneDepthCfg,
     mcfg: MetricCfg,
     prefix: str = "val",
+    export_glb: bool = False,
 ) -> dict:
     """Validation on the training forward path: loss_of_one_batch with
     inference=False gives the criterion loss AND the predictions for the depth
-    metrics in a single pass. Mirrors finetune.py::test_one_epoch."""
+    metrics in a single pass. Mirrors finetune.py::test_one_epoch.
+
+    export_glb is decided by the CALLER (which pass counts as the last one is
+    the caller's business -- the epochs==0 pure-eval path has no "last epoch"
+    at all), and is still bounded by args.export_glb_max_clips here."""
     if not torch.backends.cuda.matmul.allow_tf32:
         raise RuntimeError("TF32 matmul must stay enabled (set at module import)")
 
@@ -1067,11 +1112,11 @@ def val_loop(
             for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
-            # only the FINAL epoch's val pass writes GLBs -- a quick end-of-run
-            # sanity check, not one set per epoch (visualize_depth.py can render
-            # any checkpoint, incl. best, on demand). streaming_eval writes its
-            # own single set after training.
-            if args.export_glb and epoch == args.epochs - 1:
+            # gated by the caller (only the final val pass asks for GLBs -- a
+            # quick end-of-run sanity check, not one set per epoch;
+            # visualize_depth.py can render any checkpoint, incl. best, on
+            # demand). streaming_eval writes its own single set after training.
+            if export_glb:
                 glb_exported += _export_eval_glbs(
                     result["views"],
                     result["pred"],
