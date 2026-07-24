@@ -488,6 +488,7 @@ def run(
                 args=args,
                 mcfg=mcfg,
                 prefix=f"val/{_dataset_tag(args.val_dataset)}",
+                export_glb=args.export_glb and is_last_epoch,
             )
             # Select "best" on metric AbsRel, NOT the criterion loss. The
             # confidence-regularized loss (-alpha*log sigma) is not monotonic
@@ -513,7 +514,8 @@ def run(
     # pretrained backbone, all conditioning zero-init) and checkpoint re-eval
     # (--resume checkpoint-best.pth: rescore an arm under the current eval
     # protocol, e.g. after the sequential-sampling change). step=0 keeps it
-    # below/at the streaming_eval step so wandb drops neither.
+    # below/at the streaming_eval step so wandb drops neither. This IS the only
+    # val pass, so it is the one that exports GLBs when asked.
     if args.epochs == 0 and data_loader_val is not None:
         val_loop(
             model,
@@ -525,6 +527,7 @@ def run(
             args=args,
             mcfg=mcfg,
             prefix=f"val/{_dataset_tag(args.val_dataset)}",
+            export_glb=args.export_glb,
         )
 
     # final causal evaluation on the deployment (per-frame KV-cache) path.
@@ -1059,10 +1062,15 @@ def val_loop(
     args: FinetuneDepthCfg,
     mcfg: MetricCfg,
     prefix: str = "val",
+    export_glb: bool = False,
 ) -> dict:
     """Validation on the training forward path: loss_of_one_batch with
     inference=False gives the criterion loss AND the predictions for the depth
-    metrics in a single pass. Mirrors finetune.py::test_one_epoch."""
+    metrics in a single pass. Mirrors finetune.py::test_one_epoch.
+
+    export_glb is decided by the CALLER (which pass counts as the last one is
+    the caller's business -- the epochs==0 pure-eval path has no "last epoch"
+    at all), and is still bounded by args.export_glb_max_clips here."""
     if not torch.backends.cuda.matmul.allow_tf32:
         raise RuntimeError("TF32 matmul must stay enabled (set at module import)")
 
@@ -1104,11 +1112,11 @@ def val_loop(
             for k, vals in _val_depth_metrics(result["views"], result["pred"]).items():
                 depth_sums[k] += float(np.sum(vals))
                 depth_counts[k] += len(vals)
-            # only the FINAL epoch's val pass writes GLBs -- a quick end-of-run
-            # sanity check, not one set per epoch (visualize_depth.py can render
-            # any checkpoint, incl. best, on demand). streaming_eval writes its
-            # own single set after training.
-            if args.export_glb and epoch == args.epochs - 1:
+            # gated by the caller (only the final val pass asks for GLBs -- a
+            # quick end-of-run sanity check, not one set per epoch;
+            # visualize_depth.py can render any checkpoint, incl. best, on
+            # demand). streaming_eval writes its own single set after training.
+            if export_glb:
                 glb_exported += _export_eval_glbs(
                     result["views"],
                     result["pred"],

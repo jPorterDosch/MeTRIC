@@ -28,7 +28,7 @@ from typing import Optional
 
 from .arkitscenes import ARKitScenes_Multi
 from .arkitscenes_highres import ARKitScenesHighRes_Multi
-from .base.base_multiview_dataset import BaseMultiViewDataset
+from .base.base_multiview_dataset import BaseMultiViewDataset, validate_stride_range
 from .types import DatasetName, Split, TransformName
 from .hammer import HAMMER_Multi
 from .hypersim import HyperSim_Multi
@@ -71,8 +71,11 @@ class DatasetConfig:
     """Whether the depth/pose are in metric scale."""
     aug_crop: int = 0
     """Random crop augmentation budget in pixels (0 disables it)."""
-    allow_repeat: bool = False
-    """Allow repeating frames to reach ``num_views`` in short sequences."""
+    regular_stride: bool = True
+    """``True``: one stride per clip, i.e. a constant frame rate. ``False``:
+    gaps drawn independently per adjacent pair, so the rate varies within the
+    clip. An ablation axis, hence a config choice rather than a per-sample coin
+    flip; a no-op when ``stride_range`` has ``lo == hi``."""
     seq_aug_crop: bool = False
     """Use one shared crop delta across a sampled sequence."""
     n_corres: int = 0
@@ -106,16 +109,11 @@ class DatasetConfig:
         self.transform = TransformName(self.transform)
         if self.num_views < 1:
             raise ValueError(f"num_views must be >= 1, got {self.num_views}")
-        if (
-            len(self.stride_range) != 2
-            or self.stride_range[0] < 1
-            or self.stride_range[0] > self.stride_range[1]
-        ):
-            raise ValueError(
-                f"stride_range must be (lo, hi) with 1 <= lo <= hi, "
-                f"got {self.stride_range!r}"
-            )
-        if self.split is Split.TEST and tuple(self.stride_range) != (1, 1):
+        # one shared guard (see base_multiview_dataset): a scalar left over from
+        # the max_interval spelling, a reversed pair, or a numpy int from a
+        # sweep all fail here with the same message the constructors give
+        self.stride_range = validate_stride_range(self.stride_range, "DatasetConfig")
+        if self.split is Split.TEST and self.stride_range != (1, 1):
             raise ValueError(
                 f"TEST split requires stride_range=(1, 1) (consecutive frames; "
                 f"temporal metrics assume pixel-aligned adjacency), "
@@ -163,10 +161,10 @@ class DatasetConfig:
             split=self.split,
             num_views=self.num_views,
             resolution=[tuple(wh) for wh in self.resolution],
-            stride_range=tuple(self.stride_range),
+            stride_range=self.stride_range,  # normalized by validate() above
+            regular_stride=self.regular_stride,
             is_metric=self.is_metric,
             aug_crop=self.aug_crop,
-            allow_repeat=self.allow_repeat,
             seq_aug_crop=self.seq_aug_crop,
             n_corres=self.n_corres,
             nneg=self.nneg,
@@ -256,7 +254,11 @@ class MultiDatasetConfig:
     # --- shared, optional ---
     split: Split = Split.TRAIN
     aug_crop: int = 0
-    allow_repeat: bool = False
+    regular_stride: bool = True
+    """Shared across the mixture (see ``DatasetConfig.regular_stride``): the
+    regular/irregular choice is a property of the training objective, not of an
+    individual dataset's capture rate -- that is what ``stride_range`` is for,
+    which is why only that one is per-dataset."""
     seq_aug_crop: bool = False
     n_corres: int = 0
     nneg: int = 0
@@ -305,7 +307,7 @@ class MultiDatasetConfig:
                 split=self.split,
                 is_metric=True if self.is_metric is None else self.is_metric[i],
                 aug_crop=self.aug_crop,
-                allow_repeat=self.allow_repeat,
+                regular_stride=self.regular_stride,
                 seq_aug_crop=self.seq_aug_crop,
                 n_corres=self.n_corres,
                 nneg=self.nneg,

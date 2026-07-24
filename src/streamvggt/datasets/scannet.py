@@ -25,13 +25,16 @@ class ScanNet_Multi(BaseMultiViewDataset):
         *args,
         ROOT,
         stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        super().__init__(*args, stride_range=stride_range, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 subdir = "scans_train"
@@ -72,11 +75,7 @@ class ScanNet_Multi(BaseMultiViewDataset):
                 basenames = data["images"]
                 num_imgs = len(basenames)
                 img_ids = list(np.arange(num_imgs) + offset)
-                cut_off = (
-                    self.num_views
-                    if not self.allow_repeat
-                    else max(self.num_views // 3, 3)
-                )
+                cut_off = self.min_views()
                 start_img_ids_ = img_ids[: num_imgs - cut_off + 1]
 
                 if num_imgs < cut_off:

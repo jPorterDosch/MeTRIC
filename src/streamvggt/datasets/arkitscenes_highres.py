@@ -34,13 +34,16 @@ class ARKitScenesHighRes_Multi(BaseMultiViewDataset):
         *args,
         ROOT,
         stride_range=DEFAULT_STRIDE_RANGE,
+        regular_stride=True,
         is_metric=True,
         **kwargs,
     ):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = is_metric
-        super().__init__(*args, stride_range=stride_range, **kwargs)
+        super().__init__(
+            *args, stride_range=stride_range, regular_stride=regular_stride, **kwargs
+        )
         match self.split:
             case Split.TRAIN:
                 self.split_dir = "Training"
